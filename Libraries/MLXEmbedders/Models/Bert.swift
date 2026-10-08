@@ -549,36 +549,36 @@ private func encodedBertHiddenStates(
     return encoder(embeddings, attentionMask: mask)
 }
 
+private let bertWeightKeyReplacements: [(of: String, with: String)] = [
+    (".layer.", ".layers."),
+    (".self.key.", ".key_proj."),
+    (".self.query.", ".query_proj."),
+    (".self.value.", ".value_proj."),
+    (".attention.output.dense.", ".attention.out_proj."),
+    (".attention.output.LayerNorm.", ".ln1."),
+    (".output.LayerNorm.", ".ln2."),
+    (".intermediate.dense.", ".linear1."),
+    (".output.dense.", ".linear2."),
+    (".LayerNorm.", ".norm."),
+    ("pooler.dense.", "pooler."),
+    ("cls.predictions.transform.dense.", "lm_head.dense."),
+    ("cls.predictions.transform.LayerNorm.", "lm_head.ln."),
+    ("cls.predictions.decoder", "lm_head.decoder"),
+    ("cls.predictions.transform.norm.weight", "lm_head.ln.weight"),
+    ("cls.predictions.transform.norm.bias", "lm_head.ln.bias"),
+    ("cls.predictions.bias", "lm_head.decoder.bias"),
+    ("bert.", ""),
+    ("roberta.", ""),
+]
+
 private func sanitizeBertWeights(_ weights: [String: MLXArray]) -> [String: MLXArray] {
     weights.reduce(into: [:]) { result, item in
-        let key = item.key
-            .replacingOccurrences(of: ".layer.", with: ".layers.")
-            .replacingOccurrences(of: ".self.key.", with: ".key_proj.")
-            .replacingOccurrences(of: ".self.query.", with: ".query_proj.")
-            .replacingOccurrences(of: ".self.value.", with: ".value_proj.")
-            .replacingOccurrences(of: ".attention.output.dense.", with: ".attention.out_proj.")
-            .replacingOccurrences(of: ".attention.output.LayerNorm.", with: ".ln1.")
-            .replacingOccurrences(of: ".output.LayerNorm.", with: ".ln2.")
-            .replacingOccurrences(of: ".intermediate.dense.", with: ".linear1.")
-            .replacingOccurrences(of: ".output.dense.", with: ".linear2.")
-            .replacingOccurrences(of: ".LayerNorm.", with: ".norm.")
-            .replacingOccurrences(of: "pooler.dense.", with: "pooler.")
-            .replacingOccurrences(
-                of: "cls.predictions.transform.dense.", with: "lm_head.dense."
-            )
-            .replacingOccurrences(
-                of: "cls.predictions.transform.LayerNorm.", with: "lm_head.ln."
-            )
-            .replacingOccurrences(of: "cls.predictions.decoder", with: "lm_head.decoder")
-            .replacingOccurrences(
-                of: "cls.predictions.transform.norm.weight", with: "lm_head.ln.weight"
-            )
-            .replacingOccurrences(
-                of: "cls.predictions.transform.norm.bias", with: "lm_head.ln.bias"
-            )
-            .replacingOccurrences(of: "cls.predictions.bias", with: "lm_head.decoder.bias")
-            .replacingOccurrences(of: "bert.", with: "")
-            .replacingOccurrences(of: "roberta.", with: "")
+        // Applied in order. A loop rather than a 19-call chain: the chain timed out
+        // the type checker on Linux.
+        var key = item.key
+        for replacement in bertWeightKeyReplacements {
+            key = key.replacingOccurrences(of: replacement.of, with: replacement.with)
+        }
 
         result[key] = item.value
     }.filter { key, _ in

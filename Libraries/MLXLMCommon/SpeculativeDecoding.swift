@@ -4,10 +4,14 @@ import Foundation
 import MLX
 
 private func defaultSpeculativeDecodingMemoryLimit() -> Int? {
+    #if canImport(Metal)
     guard let bytes = GPU.maxRecommendedWorkingSetBytes(), bytes > 0 else {
         return nil
     }
     return bytes
+    #else
+    return nil
+    #endif
 }
 
 /// Runtime counters for a speculative decoding pass.
