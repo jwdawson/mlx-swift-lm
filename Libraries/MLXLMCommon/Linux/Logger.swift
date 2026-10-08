@@ -8,6 +8,9 @@ typealias Logger = os.Logger
 
 #else
 
+/// Prints to standard output off Apple platforms. Like `os.Logger`, it takes only
+/// interpolated messages (``LogMessage``), and every interpolated value that is not
+/// marked `privacy: .public` prints as `<private>`.
 final class Logger: Sendable {
     private let subsystem: String
     private let category: String
@@ -17,33 +20,34 @@ final class Logger: Sendable {
         self.category = category
     }
 
-    func debug(_ message: String) {
-        print("[DEBUG] [\(subsystem).\(category)] \(message)")
+    func debug(_ message: LogMessage) {
+        print("[DEBUG] [\(subsystem).\(category)] \(message.text)")
     }
 
-    func info(_ message: String) {
-        print("[INFO] [\(subsystem).\(category)] \(message)")
+    func info(_ message: LogMessage) {
+        print("[INFO] [\(subsystem).\(category)] \(message.text)")
     }
 
-    func notice(_ message: String) {
-        print("[NOTICE] [\(subsystem).\(category)] \(message)")
+    func notice(_ message: LogMessage) {
+        print("[NOTICE] [\(subsystem).\(category)] \(message.text)")
     }
 
-    func warning(_ message: String) {
-        print("[WARNING] [\(subsystem).\(category)] \(message)")
+    func warning(_ message: LogMessage) {
+        print("[WARNING] [\(subsystem).\(category)] \(message.text)")
     }
 
-    func error(_ message: String) {
-        print("[ERROR] [\(subsystem).\(category)] \(message)")
+    func error(_ message: LogMessage) {
+        print("[ERROR] [\(subsystem).\(category)] \(message.text)")
     }
 
-    func fault(_ message: String) {
-        print("[FAULT] [\(subsystem).\(category)] \(message)")
+    func fault(_ message: LogMessage) {
+        print("[FAULT] [\(subsystem).\(category)] \(message.text)")
     }
 }
 
-/// Accepts os.Logger-style `\(value, privacy: .public)` interpolations off Apple platforms,
-/// so the same call sites compile; privacy has no effect on printed output.
+/// Accepts os.Logger-style `\(value, privacy: .public)` interpolations off Apple platforms.
+/// Values are redacted to `<private>` unless marked `.public` (stricter than os.Logger's
+/// `.auto`, which also shows scalars: nothing is printed in clear unless asked for).
 struct LogMessage: ExpressibleByStringInterpolation, Sendable {
     enum Privacy: Sendable {
         case `public`, `private`, auto
@@ -61,7 +65,7 @@ struct LogMessage: ExpressibleByStringInterpolation, Sendable {
         }
 
         mutating func appendInterpolation<T>(_ value: T, privacy: Privacy = .auto) {
-            text += String(describing: value)
+            text += privacy == .public ? String(describing: value) : "<private>"
         }
     }
 
@@ -74,15 +78,6 @@ struct LogMessage: ExpressibleByStringInterpolation, Sendable {
     init(stringInterpolation: StringInterpolation) {
         text = stringInterpolation.text
     }
-}
-
-extension Logger {
-    func debug(_ message: LogMessage) { debug(message.text) }
-    func info(_ message: LogMessage) { info(message.text) }
-    func notice(_ message: LogMessage) { notice(message.text) }
-    func warning(_ message: LogMessage) { warning(message.text) }
-    func error(_ message: LogMessage) { error(message.text) }
-    func fault(_ message: LogMessage) { fault(message.text) }
 }
 
 #endif

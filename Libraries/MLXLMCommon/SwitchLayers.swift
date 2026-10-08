@@ -44,6 +44,7 @@ public func scatterUnsort(x: MLXArray, invOrder: MLXArray, shape: [Int]? = nil) 
 /// `[tokens, topK, hidden]` tensor and then reduces `topK`. This kernel reads
 /// the sorted rows through the inverse permutation and writes
 /// `[tokens, hidden]` directly, avoiding that intermediate allocation.
+#if canImport(Metal)
 private let weightedExpertUnsortKernel = MLXFast.metalKernel(
     name: "weighted_expert_unsort",
     inputNames: ["sorted_outputs", "inverse_order", "weights"],
@@ -66,6 +67,7 @@ private let weightedExpertUnsortKernel = MLXFast.metalKernel(
             output[token * threads_per_grid.x + feature] = accumulator;
         """,
     ensureRowContiguous: true)
+#endif
 
 /// Reduce sorted top-8 bfloat16 expert rows without materializing their
 /// unsorted assignment tensor. Callers must retain the established path for
@@ -91,6 +93,7 @@ package func weightedExpertUnsort(
         sortedOutputs.dim(0) == weights.size && inverseOrder.size == weights.size,
         "weightedExpertUnsort assignment counts must match")
 
+    #if canImport(Metal)
     let tokens = weights.dim(0)
     return weightedExpertUnsortKernel(
         [sortedOutputs, inverseOrder, weights],
@@ -100,6 +103,24 @@ package func weightedExpertUnsort(
         outputShapes: [[tokens, hidden]],
         outputDTypes: [.bfloat16]
     )[0]
+    #else
+    return weightedExpertUnsortOps(
+        sortedOutputs: sortedOutputs, inverseOrder: inverseOrder, weights: weights)
+    #endif
+}
+
+/// The plain-ops form of ``weightedExpertUnsort``, used where there is no Metal: the
+/// established unsort (`scatterUnsort`) followed by ``weightedExpertSum``, which the
+/// kernel reproduces bit for bit.
+func weightedExpertUnsortOps(
+    sortedOutputs: MLXArray,
+    inverseOrder: MLXArray,
+    weights: MLXArray
+) -> MLXArray {
+    let unsorted = scatterUnsort(
+        x: sortedOutputs, invOrder: inverseOrder,
+        shape: [weights.dim(0), weights.dim(1)])
+    return weightedExpertSum(unsorted, weights)
 }
 
 // MARK: - SwitchGLU

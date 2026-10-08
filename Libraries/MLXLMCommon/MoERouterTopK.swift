@@ -57,6 +57,7 @@ private let routerTopKSource = """
     }
     """
 
+#if canImport(Metal)
 private final class RouterTopKKernel: Sendable {
     static let shared = RouterTopKKernel()
     let kernel: MLXFast.MLXFastKernel
@@ -70,6 +71,7 @@ private final class RouterTopKKernel: Sendable {
         )
     }
 }
+#endif
 
 /// Metal's threads-per-threadgroup ceiling. The fused router uses one thread
 /// per expert, so larger routers must retain the generic MLX path.
@@ -110,6 +112,7 @@ package func fusedRouterTopK(
     precondition(e <= maxFusedRouterExperts, "fused router exceeds Metal threadgroup limit")
     precondition(k > 0 && k <= e, "invalid fused router top-k")
 
+    #if canImport(Metal)
     let rows = selection.size / e
     let shape = Array(selection.shape.dropLast()) + [k]
     let out = RouterTopKKernel.shared.kernel(
@@ -127,6 +130,35 @@ package func fusedRouterTopK(
         outputDTypes: [.uint32, values.dtype]
     )
     return (out[0], out[1])
+    #else
+    return routerTopKOps(
+        selection: selection, values: values, k: k, normalize: normalize, order: order)
+    #endif
+}
+
+/// The plain-ops form of the fused router, used where there is no Metal: the generic
+/// `argPartition` selection in the requested winner order, the selected-value gather,
+/// and optional normalization — the expressions the kernel is bit-identical to.
+func routerTopKOps(
+    selection: MLXArray,
+    values: MLXArray,
+    k: Int,
+    normalize: Bool,
+    order: FusedRouterTopKOrder
+) -> (indices: MLXArray, scores: MLXArray) {
+    let indices: MLXArray
+    switch order {
+    case .ascending:
+        let kth = selection.dim(-1) - k
+        indices = MLX.argPartition(selection, kth: kth, axis: -1)[.ellipsis, kth...]
+    case .descending:
+        indices = MLX.argPartition(-selection, kth: k - 1, axis: -1)[.ellipsis, ..<k]
+    }
+    var scores = MLX.takeAlong(values, indices, axis: -1)
+    if normalize {
+        scores = scores / scores.sum(axis: -1, keepDims: true)
+    }
+    return (indices, scores)
 }
 
 /// Top-`k` + optional normalisation over the last axis in one dispatch:

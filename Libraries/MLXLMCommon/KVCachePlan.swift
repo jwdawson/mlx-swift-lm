@@ -419,6 +419,13 @@ extension GenerateParameters {
 
     package func kvCachePlan() throws -> KVCachePlan {
         let configuration = try resolvedKVCacheConfiguration()
+        #if !canImport(Metal)
+        // TurboQuant's encode, score and flash-attention steps exist only as custom
+        // Metal kernels; refuse the request up front rather than fail mid-generation.
+        if case .turboQuant = configuration?.strategy.storage {
+            throw MetalKernelUnavailableError(feature: "TurboQuant KV-cache compression")
+        }
+        #endif
         let requestSource: KVCacheStatus.RequestSource? =
             if configuration == nil {
                 nil

@@ -2274,6 +2274,9 @@ private func restoreCacheFromMetaState(
         return cache
 
     case "TurboQuantKVCache":
+        #if !canImport(Metal)
+        throw MetalKernelUnavailableError(feature: "A TurboQuant-compressed prompt cache")
+        #else
         guard metaState.count >= 5,
             let bits = Int(metaState[1]),
             let keyBits = Int(metaState[2]),
@@ -2288,6 +2291,7 @@ private func restoreCacheFromMetaState(
         cache.state = state
         cache.metaState = metaState
         return cache
+        #endif
 
     case "CacheList":
         return try CacheList.fromState(state: state, metaState: metaState)

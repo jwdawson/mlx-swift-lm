@@ -19,6 +19,12 @@ package func applyKVCacheConfigurationValidated(
     cache: inout [KVCache],
     configuration: KVCacheConfiguration
 ) throws -> (result: KVCacheApplicationResult, isTerminal: Bool) {
+    #if !canImport(Metal)
+    // TurboQuant runs only as custom Metal kernels (see `kvCachePlan()`).
+    if case .turboQuant = configuration.strategy.storage {
+        throw MetalKernelUnavailableError(feature: "TurboQuant KV-cache compression")
+    }
+    #endif
     try validateKVCacheCompatibility(cache, configuration: configuration)
     let before = KVCacheTree.leaves(in: cache)
     let isTerminal = applyKVCacheConfigurationFast(

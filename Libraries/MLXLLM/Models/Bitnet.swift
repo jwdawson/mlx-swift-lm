@@ -12,6 +12,7 @@ import MLXNN
 
 // port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/bitnet.py
 
+#if canImport(Metal)
 private func makeBitLinearKernel() -> MLXFast.MLXFastKernel {
     let source = """
         constexpr int M = 4;
@@ -70,6 +71,29 @@ private final class BitLinearKernelManager: Sendable {
         bitlinearKernel = makeBitLinearKernel()
     }
 }
+#endif
+
+/// The plain-ops form of the `bitlinear_matmul` kernel, used where there is no Metal.
+///
+/// Each packed byte of row `r` holds four ternary weights (2 bits each, stored as
+/// `w + 1`) for output rows `r + i * (outFeatures / 4)`, `i` = 0...3. Unpacks them to
+/// a dense `[outFeatures, inFeatures]` float32 matrix, multiplies in float32 as the
+/// kernel accumulates, applies the weight scale in float32, and rounds once to the
+/// scale's dtype.
+func bitLinearMatmulOps(
+    _ x: MLXArray, packedWeights: MLXArray, weightScale: MLXArray,
+    outFeatures: Int, invertWeightScales: Bool
+) -> MLXArray {
+    let packedRows = packedWeights[..<(outFeatures / 4)]
+    let planes = (0 ..< 4).map { i in
+        ((packedRows >> (2 * i)) & 3).asType(.float32) - 1
+    }
+    let weights = MLX.concatenated(planes, axis: 0)
+    let sums = MLX.matmul(x.asType(.float32), weights.transposed())
+    // The kernel takes the reciprocal in the scale's own dtype (`1 / weight_scale[0]`).
+    let factor = (invertWeightScales ? 1 / weightScale : weightScale).asType(.float32)
+    return (sums * factor).asType(weightScale.dtype)
+}
 
 class BitLinear: Module {
     let inFeatures: Int
@@ -112,13 +136,14 @@ class BitLinear: Module {
             x = x.reshaped(-1, originalShape[originalShape.count - 1])
         }
 
-        let totalBatchElements = x.dim(0)
-        let inFeatures = x.dim(1)
-
         let outFeatures = self.outFeatures
 
         let dtype = self.weightScale.dtype
         assert(x.dtype == dtype, "Wrong type for input.")
+
+        #if canImport(Metal)
+        let totalBatchElements = x.dim(0)
+        let inFeatures = x.dim(1)
 
         var outputs = BitLinearKernelManager.shared.bitlinearKernel(
             [x, packedWeights, weightScale],
@@ -133,6 +158,11 @@ class BitLinear: Module {
             outputShapes: [[totalBatchElements, outFeatures]],
             outputDTypes: [dtype]
         )[0]
+        #else
+        var outputs = bitLinearMatmulOps(
+            x, packedWeights: packedWeights, weightScale: weightScale,
+            outFeatures: outFeatures, invertWeightScales: invertWeightScales)
+        #endif
 
         if originalShape.count > 2 {
             outputs = outputs.reshaped(Array(originalShape.dropLast()) + [outFeatures])
