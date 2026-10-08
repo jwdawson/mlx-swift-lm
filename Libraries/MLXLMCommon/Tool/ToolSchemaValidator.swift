@@ -732,7 +732,7 @@ package enum ToolSchemaValidator {
     /// from `JSONSerialization` must not pass as one.
     private static func strictBoolean(_ value: Any) -> Bool? {
         if let boxed = value as? NSNumber {
-            return CFGetTypeID(boxed) == CFBooleanGetTypeID() ? boxed.boolValue : nil
+            return isBoxedBoolean(boxed) ? boxed.boolValue : nil
         }
         return value as? Bool
     }

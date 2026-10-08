@@ -91,7 +91,7 @@ public enum JSONValue: Hashable, Codable, Sendable {
     /// `{"limit": 1}` becomes `{"limit": true}` — so the boolean case is keyed
     /// on the boxed type instead of on a cast that a number also satisfies.
     private static func from(_ number: NSNumber) -> JSONValue {
-        if CFGetTypeID(number) == CFBooleanGetTypeID() {
+        if isBoxedBoolean(number) {
             return .bool(number.boolValue)
         }
         if let int = number as? Int {
@@ -166,4 +166,15 @@ public enum JSONValue: Hashable, Codable, Sendable {
             return ["type": "object", "properties": props]
         }
     }
+}
+
+/// Whether `number` boxes a Boolean (as `JSONSerialization` boxes `true`/`false`).
+func isBoxedBoolean(_ number: NSNumber) -> Bool {
+    #if canImport(Darwin)
+    return CFGetTypeID(number) == CFBooleanGetTypeID()
+    #else
+    // swift-corelibs-foundation exposes no CFBoolean type ID; its boxed Booleans
+    // report "c", while its boxed integers (Int8 included) report "i" or wider.
+    return String(cString: number.objCType) == "c"
+    #endif
 }

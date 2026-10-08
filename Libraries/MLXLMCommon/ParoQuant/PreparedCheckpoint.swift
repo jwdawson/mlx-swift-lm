@@ -177,10 +177,16 @@ public enum ParoQuantPreparedCheckpoint {
             // runners, VMs) don't provide — it reports nil or 0 there. Fall
             // back to the statfs-backed value; the guard is advisory, so an
             // unknown capacity must never veto the write.
+            #if canImport(Darwin)
             let capacity = try? directory.resourceValues(forKeys: [
                 .volumeAvailableCapacityForImportantUsageKey, .volumeAvailableCapacityKey,
             ])
             let importantUsage = capacity?.volumeAvailableCapacityForImportantUsage ?? 0
+            #else
+            // swift-corelibs-foundation has no importantUsage capacity.
+            let capacity = try? directory.resourceValues(forKeys: [.volumeAvailableCapacityKey])
+            let importantUsage: Int64 = 0
+            #endif
             let free =
                 importantUsage > 0
                 ? importantUsage : Int64(capacity?.volumeAvailableCapacity ?? 0)
