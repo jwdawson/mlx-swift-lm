@@ -307,6 +307,13 @@ public func bicubicInterpolate(
     let filterScaleH: Float = (antialias && scaleH < 1.0) ? (1.0 / scaleH) : 1.0
     let filterScaleW: Float = (antialias && scaleW < 1.0) ? (1.0 / scaleW) : 1.0
 
+    #if !canImport(Metal)
+    _ = (batchSize, channels)
+    return bicubicInterpolateOps(
+        x, outH: outH, outW: outW, alignCorners: alignCorners,
+        antialias: antialiasFlag > 0.5, filterScaleH: filterScaleH, filterScaleW: filterScaleW,
+        support: support)
+    #else
     // Create parameters tensor
     let params = MLXArray(
         [
@@ -348,6 +355,7 @@ public func bicubicInterpolate(
     }
 
     return result
+    #endif
 }
 
 /// Bicubic interpolation with a single scale factor.
@@ -405,6 +413,10 @@ public func nearestInterpolate(
         fatalError("Either size or scaleFactor must be specified")
     }
 
+    #if !canImport(Metal)
+    _ = (batchSize, channels, inH, inW)
+    return nearestInterpolateOps(x, outH: outH, outW: outW)
+    #else
     // Create dimensions tensor
     let dims = MLXArray([batchSize, channels, inH, inW, outH, outW]).asType(.int32)
 
@@ -438,6 +450,7 @@ public func nearestInterpolate(
     }
 
     return result
+    #endif
 }
 
 /// Nearest neighbor interpolation with a single scale factor.
@@ -451,4 +464,108 @@ public func nearestInterpolate(
     scaleFactor: Float
 ) -> MLXArray {
     nearestInterpolate(x, scaleFactor: (scaleFactor, scaleFactor))
+}
+
+// MARK: - Plain-Ops Fallbacks
+
+/// One axis of the bicubic kernel's separable filter as a dense `[outSize, inSize]`
+/// row-major weight table, computed exactly as `bicubic_interpolation_antialias`
+/// computes each tap (coordinate mapping, support window, clamping, cubic weight).
+private func bicubicAxisWeights(
+    inSize: Int, outSize: Int, alignCorners: Bool, antialias: Bool, filterScale: Float,
+    support: Float
+) -> [Float] {
+    func cubic(_ x: Float) -> Float {
+        let absx = abs(x)
+        let absx2 = absx * absx
+        let absx3 = absx2 * absx
+        let a: Float = -0.5
+        if absx <= 1 {
+            return (a + 2) * absx3 - (a + 3) * absx2 + 1
+        } else if absx < 2 {
+            return a * absx3 - 5 * a * absx2 + 8 * a * absx - 4 * a
+        }
+        return 0
+    }
+
+    let axisSupport = antialias ? support * filterScale : support
+    var weights = [Float](repeating: 0, count: outSize * inSize)
+    for out in 0 ..< outSize {
+        let center: Float =
+            alignCorners
+            ? Float(out) * Float(inSize - 1) / Float(outSize - 1)
+            : ((Float(out) + 0.5) / Float(outSize)) * Float(inSize) - 0.5
+        let start = max(0, Int((center - axisSupport).rounded(.down)) + 1)
+        let end = min(inSize, Int((center + axisSupport).rounded(.down)) + 1)
+        guard start < end else { continue }
+        for position in start ..< end {
+            let distance = Float(position) - center
+            weights[out * inSize + position] =
+                antialias ? cubic(distance / filterScale) : cubic(distance)
+        }
+    }
+    return weights
+}
+
+/// The plain-ops form of the bicubic kernel, used where there is no Metal.
+///
+/// The kernel's 2-D filter is the product of one weight per axis, normalized by the
+/// sum of those products, so it factors into two matrix products with per-axis
+/// weight tables plus one division by the outer product of their row sums (skipped
+/// where that sum is at most 1e-8, as in the kernel).
+func bicubicInterpolateOps(
+    _ x: MLXArray, outH: Int, outW: Int, alignCorners: Bool, antialias: Bool,
+    filterScaleH: Float, filterScaleW: Float, support: Float
+) -> MLXArray {
+    let inH = x.dim(2)
+    let inW = x.dim(3)
+    // The kernel aligns corners only when both output sides exceed one pixel.
+    let align = alignCorners && outW > 1 && outH > 1
+
+    let rows = bicubicAxisWeights(
+        inSize: inH, outSize: outH, alignCorners: align, antialias: antialias,
+        filterScale: filterScaleH, support: support)
+    let columns = bicubicAxisWeights(
+        inSize: inW, outSize: outW, alignCorners: align, antialias: antialias,
+        filterScale: filterScaleW, support: support)
+
+    var sums = [Float](repeating: 0, count: outH * outW)
+    for y in 0 ..< outH {
+        let rowSum = rows[(y * inH) ..< ((y + 1) * inH)].reduce(0, +)
+        for column in 0 ..< outW {
+            let columnSum = columns[(column * inW) ..< ((column + 1) * inW)].reduce(0, +)
+            sums[y * outW + column] = rowSum * columnSum
+        }
+    }
+
+    let rowWeights = MLXArray(rows, [outH, inH])
+    let columnWeights = MLXArray(columns, [outW, inW])
+    let weightSums = MLXArray(sums, [outH, outW])
+
+    let raw = MLX.matmul(MLX.matmul(rowWeights, x.asType(.float32)), columnWeights.transposed())
+    var result = MLX.where(weightSums .> Float(1e-8), raw / weightSums, raw)
+    if x.dtype != .float32 {
+        result = result.asType(x.dtype)
+    }
+    return result
+}
+
+/// The plain-ops form of the nearest-neighbor kernel, used where there is no Metal:
+/// the same floor-based source index per output pixel, gathered along each axis.
+func nearestInterpolateOps(_ x: MLXArray, outH: Int, outW: Int) -> MLXArray {
+    func sourceIndices(inSize: Int, outSize: Int) -> MLXArray {
+        let scale = Float(inSize) / Float(outSize)
+        let indices = (0 ..< outSize).map { out in
+            Int32(max(0, min(Int((Float(out) * scale).rounded(.down)), inSize - 1)))
+        }
+        return MLXArray(indices)
+    }
+
+    var result = x.asType(.float32)
+    result = MLX.take(result, sourceIndices(inSize: x.dim(2), outSize: outH), axis: 2)
+    result = MLX.take(result, sourceIndices(inSize: x.dim(3), outSize: outW), axis: 3)
+    if x.dtype != .float32 {
+        result = result.asType(x.dtype)
+    }
+    return result
 }

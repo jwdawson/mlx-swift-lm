@@ -636,6 +636,9 @@ public class TurboQuantKVCache: BaseKVCache, SharedAttentionKVCache {
     public override class func restore(
         state: [MLXArray], metaState: [String]
     ) throws -> any KVCache {
+        #if !canImport(Metal)
+        throw MetalKernelUnavailableError(feature: "A TurboQuant-compressed prompt cache")
+        #else
         guard metaState.count >= 5,
             let bits = Int(metaState[1]),
             let keyBits = Int(metaState[2]),
@@ -650,6 +653,7 @@ public class TurboQuantKVCache: BaseKVCache, SharedAttentionKVCache {
         cache.state = state
         cache.metaState = metaState
         return cache
+        #endif
     }
 
     public let bits: Int  // Legacy: used when keyBits == valueBits

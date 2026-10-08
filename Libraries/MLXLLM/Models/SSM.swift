@@ -18,7 +18,9 @@ public func computeDt(_ dt: MLXArray, _ dtBias: MLXArray, _ timeStepLimit: (Floa
     return MLX.clip(dt, min: timeStepLimit.0, max: timeStepLimit.1)
 }
 
+/// Nil where there is no Metal; `ssmUpdate` then takes `ssmAttn`.
 private func makeSSMKernel() -> MLXFast.MLXFastKernel? {
+    #if canImport(Metal)
     let source = """
             auto n = thread_position_in_grid.z;
             auto h_idx = n % H;
@@ -65,6 +67,9 @@ private func makeSSMKernel() -> MLXFast.MLXFastKernel? {
         outputNames: ["out", "state_out"],
         source: source
     )
+    #else
+    return nil
+    #endif
 }
 
 private final class SSMKernelManager: Sendable {

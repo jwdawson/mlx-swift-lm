@@ -23,7 +23,9 @@ private let computeGatedDeltaG: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXA
 
 // MARK: - Metal Kernel
 
+/// Nil where there is no Metal; `gatedDeltaUpdate` then takes `gatedDeltaOps`.
 private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
+    #if canImport(Metal)
     let maskSource = hasMask ? "mask[b_idx * T + t]" : "true"
 
     let source = """
@@ -120,6 +122,9 @@ private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
         outputNames: ["y", "state_out"],
         source: source
     )
+    #else
+    return nil
+    #endif
 }
 
 private final class GatedDeltaKernelManager: Sendable {
@@ -363,6 +368,25 @@ private func fastGatedDelta(
     return (y.asType(q.dtype), state)
 }
 
+/// `gatedDeltaOps` standing in for `gatedDeltaKernel` where there is no Metal. The
+/// kernel writes a zero output at every masked step, where the ops path still emits
+/// `state · q`; both leave the state untouched there, so only the output differs.
+func gatedDeltaOpsAsKernel(
+    q: MLXArray,
+    k: MLXArray,
+    v: MLXArray,
+    g: MLXArray,
+    beta: MLXArray,
+    state: MLXArray,
+    mask: MLXArray? = nil
+) -> (MLXArray, MLXArray) {
+    let (y, newState) = gatedDeltaOps(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
+    guard let mask else { return (y, newState) }
+    // The kernel's mask is [B, T]; the output is [B, T, Hv, Dv].
+    let keep = expandedDimensions(mask, axes: [2, 3])
+    return (MLX.where(keep, y, MLXArray.zeros(like: y)), newState)
+}
+
 // MARK: - Public API
 
 public func gatedDeltaUpdate(
@@ -412,6 +436,12 @@ public func gatedDeltaUpdate(
     if useKernel, GatedDeltaKernelManager.shared.kernel != nil, Dk % 32 == 0 {
         return gatedDeltaKernel(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
     }
+
+    #if !canImport(Metal)
+    if useKernel, Dk % 32 == 0 {
+        return gatedDeltaOpsAsKernel(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
+    }
+    #endif
 
     return gatedDeltaOps(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
 }

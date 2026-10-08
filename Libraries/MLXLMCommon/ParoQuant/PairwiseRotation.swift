@@ -335,6 +335,9 @@ nonisolated func dispatchPairwiseRotation(
 
     let dim = state.scalesFlat.dim(0)
     assertRotationGeometry(dims: dim, groupSize: groupSize, krot: krot)
+    #if !canImport(Metal)
+    return pairwiseRotationOps(flat, state: state, groupSize: groupSize, krot: krot)
+    #else
     let numGroups = dim / groupSize
     let tile = batch <= 1 ? 1 : 4
     let params = MLXArray([Int32(batch), Int32(dim), Int32(krot), Int32(groupSize)])
@@ -350,6 +353,35 @@ nonisolated func dispatchPairwiseRotation(
         outputShapes: [flat.shape],
         outputDTypes: [flat.dtype]
     )[0]
+    #endif
+}
+
+/// The plain-ops form of the rotation kernels, used where there is no Metal: the same
+/// math in the same order — f32 `x * channel_scale`, then `krot` rounds of
+/// within-group Givens rotations (`a * c + b * s`, `b * c - a * s` in f32) over the
+/// round's disjoint pairs, then one rounding to the activation dtype.
+nonisolated func pairwiseRotationOps(
+    _ flat: MLXArray, state: RotationDerivedState, groupSize: Int, krot: Int
+) -> MLXArray {
+    let pairSlots = state.packedPairs.dim(1)
+    // Global channel offset of each pair slot's group.
+    let groupBase = MLXArray(
+        (0 ..< pairSlots).map { Int32(($0 / (groupSize / 2)) * groupSize) })
+
+    let x = flat.asType(.float32) * state.scalesFlat.asType(.float32)
+    for round in 0 ..< krot {
+        let packed = state.packedPairs[round]
+        let first = groupBase + (packed & 0xFFFF)
+        let second = groupBase + (packed >> 16)
+        let c = state.cosTheta[round].asType(.float32)
+        let s = state.sinTheta[round].asType(.float32)
+
+        let a = MLX.take(x, first, axis: 1)
+        let b = MLX.take(x, second, axis: 1)
+        x[0..., first] = a * c + b * s
+        x[0..., second] = b * c - a * s
+    }
+    return x.asType(flat.dtype)
 }
 
 // MARK: - Pair Packing
