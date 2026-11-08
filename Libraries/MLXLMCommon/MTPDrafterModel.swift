@@ -291,17 +291,19 @@ package func finalizeShiftedMTPDrafterState(
         && state.cache.allSatisfy { $0.offset == state.nextPosition }
 }
 
-/// Iterator-owned MTP continuation carried atomically with a ChatSession's
-/// target cache, target model state, and transcript.
+/// Iterator-owned MTP continuation carried atomically with a target cache,
+/// target model state, and transcript.
 ///
 /// `targetProcessedTokenCount` is only an alignment witness. The authoritative
-/// position remains `KVCacheStorage.processedTokenCount`.
-package struct MTPDrafterContinuation {
-    package var state: MTPDrafterState
-    package let targetBoundaryHidden: MLXArray
-    package let targetProcessedTokenCount: Int
+/// position remains the target cache's own. A continuation is valid only with
+/// the exact cache it was finalized against; callers that copy, trim, or
+/// replace that cache must copy or drop the continuation to match.
+public struct MTPDrafterContinuation {
+    public package(set) var state: MTPDrafterState
+    public let targetBoundaryHidden: MLXArray
+    public let targetProcessedTokenCount: Int
 
-    package init(
+    public init(
         state: consuming MTPDrafterState,
         targetBoundaryHidden: MLXArray,
         targetProcessedTokenCount: Int
@@ -309,6 +311,13 @@ package struct MTPDrafterContinuation {
         self.state = consume state
         self.targetBoundaryHidden = targetBoundaryHidden
         self.targetProcessedTokenCount = targetProcessedTokenCount
+    }
+
+    /// A copy whose drafter caches share no mutable state with this one.
+    public func copy() -> MTPDrafterContinuation {
+        var copied = self
+        copied.state.cache = state.cache.map { $0.copy() }
+        return copied
     }
 }
 

@@ -370,11 +370,7 @@ public final class ChatSession {
 
         /// A copy that shares no mutable state with this cache.
         func copy() -> RealizedCache {
-            let mtpContinuation = mtpDrafterContinuation.map { continuation in
-                var copied = continuation
-                copied.state.cache = continuation.state.cache.map { $0.copy() }
-                return copied
-            }
+            let mtpContinuation = mtpDrafterContinuation?.copy()
             return RealizedCache(
                 main: main.copy(), draft: draft?.copy(), state: state,
                 mtpDrafterContinuation: mtpContinuation, conversation: conversation)

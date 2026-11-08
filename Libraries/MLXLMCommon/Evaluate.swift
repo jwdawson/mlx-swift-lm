@@ -2682,6 +2682,127 @@ public func generateTokensTask(
     )
 }
 
+/// What one MTP round leaves for the next: the target state and drafter continuation
+/// aligned to the cache's final position, and the round's speculation counts.
+///
+/// `continuation` is `nil` when speculation stood down (`passthroughReason` says why) or
+/// the drafter keeps no state. Hand both back with the same cache on the next round.
+public struct MTPRoundResult: Sendable {
+    private final class Payload: @unchecked Sendable {
+        // Settled MLX values, read only after the round's task has ended.
+        let state: LMOutput.State?
+        let continuation: MTPDrafterContinuation?
+
+        init(state: LMOutput.State?, continuation: MTPDrafterContinuation?) {
+            self.state = state
+            self.continuation = continuation
+        }
+    }
+
+    private let payload: Payload
+    public var state: LMOutput.State? { payload.state }
+    public var continuation: MTPDrafterContinuation? { payload.continuation }
+    public let drafted: Int
+    public let accepted: Int
+    public let passthroughReason: String?
+
+    init(iterator: MTPSpeculativeTokenIterator) {
+        payload = Payload(state: iterator.state, continuation: iterator.mtpDrafterContinuation)
+        drafted = iterator.proposedCount
+        accepted = iterator.acceptedCount
+        passthroughReason = iterator.passthroughReason
+    }
+}
+
+private struct MTPRoundCollector: GeneratedTokenCollector {
+    mutating func record(_ token: Int) {}
+
+    consuming func result(iterator: any TokenIteratorProtocol) -> MTPRoundResult {
+        guard let iterator = iterator as? MTPSpeculativeTokenIterator else {
+            preconditionFailure("MTPRoundCollector runs only an MTPSpeculativeTokenIterator")
+        }
+        return MTPRoundResult(iterator: iterator)
+    }
+}
+
+/// Raw MTP generation on a caller-owned cache, resuming the drafter from `mtpContinuation`.
+///
+/// Mirrors ``generateTokensTask(input:cache:state:parameters:context:includeStopToken:components:wiredMemoryTicket:)``.
+/// The task's value carries the round's final target state and the drafter continuation
+/// finalized against `cache`, for the next round on the same cache. With an empty cache
+/// pass no continuation; a stateful drafter then starts from the prompt. A warm cache
+/// without a continuation aligned to it runs the round without speculation.
+public func generateTokensTask(
+    input: LMInput,
+    cache: [KVCache],
+    state: LMOutput.State?,
+    mtpContinuation: MTPDrafterContinuation?,
+    parameters: GenerateParameters,
+    context: ModelContext,
+    mtpDrafter: any MTPDrafterModel,
+    blockSize: Int,
+    includeStopToken: Bool = false,
+    components: GenerationComponents = .init(),
+    wiredMemoryTicket: WiredMemoryTicket? = nil
+) throws -> (AsyncStream<TokenGeneration>, Task<MTPRoundResult, Never>) {
+    let iterator = try MTPSpeculativeTokenIterator(
+        input: input,
+        mainModel: context.model,
+        drafter: mtpDrafter,
+        mainCache: cache,
+        mainState: state,
+        mtpContinuation: mtpContinuation,
+        parameters: parameters,
+        blockSize: blockSize,
+        components: components)
+    return generateLoopTask(
+        promptTokenCount: input.text.tokens.size,
+        modelConfiguration: context.configuration,
+        tokenizer: context.tokenizer,
+        iterator: iterator,
+        wiredMemoryTicket: wiredMemoryTicket,
+        includeStopToken: includeStopToken,
+        tokenCollector: MTPRoundCollector(),
+        handler: RawTokenLoopHandler())
+}
+
+/// Commits `input` into `cache` and brings the drafter's state over it, without generating.
+///
+/// Starts the drafter when `cache` is empty and resumes it from `mtpContinuation`
+/// otherwise. The token sampled after `input` is discarded, so the result's continuation
+/// is aligned to the cache's new position. `drafted` and `accepted` are 0.
+public func mtpPrefill(
+    input: LMInput,
+    cache: [KVCache],
+    state: LMOutput.State?,
+    mtpContinuation: MTPDrafterContinuation?,
+    parameters: GenerateParameters,
+    context: ModelContext,
+    mtpDrafter: any MTPDrafterModel,
+    components: GenerationComponents = .init()
+) throws -> MTPRoundResult {
+    let storage = KVCacheStorage(cache, plan: try parameters.kvCachePlan())
+    let expectedPosition = storage.processedTokenCount + input.text.cacheSequenceLength
+    var iterator = try MTPSpeculativeTokenIterator(
+        input: input,
+        mainModel: context.model,
+        drafter: mtpDrafter,
+        mainCacheStorage: storage,
+        mainState: state,
+        mtpContinuation: mtpContinuation,
+        parameters: parameters,
+        blockSize: Swift.max(2, mtpDrafter.maximumBlockSize ?? 2),
+        components: components)
+    // Nothing was consumed, so finalizing rewinds any bonus the prefill committed.
+    iterator.finalizeGeneration()
+    let position = iterator.mainCacheStorage.processedTokenCount
+    guard position == expectedPosition else {
+        throw KVCacheError(
+            message: "mtpPrefill left the cache at \(position), not \(expectedPosition)")
+    }
+    return MTPRoundResult(iterator: iterator)
+}
+
 /// Package-only raw generation for framed response protocols.
 ///
 /// The decoder remains owned by the caller; this function only applies its

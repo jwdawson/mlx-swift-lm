@@ -173,6 +173,34 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             components: components)
     }
 
+    /// Resumes a stream on a warm `mainCache`: `mainState` is the target state saved with it,
+    /// and `mtpContinuation` the drafter state finalized against exactly that cache.
+    /// A continuation that does not match the cache's position runs the round without speculation.
+    public init(
+        input: LMInput,
+        mainModel: any LanguageModel,
+        drafter: any MTPDrafterModel,
+        mainCache: [KVCache]? = nil,
+        mainState: LMOutput.State?,
+        mtpContinuation: MTPDrafterContinuation?,
+        parameters: GenerateParameters,
+        blockSize: Int,
+        components: GenerationComponents = .init()
+    ) throws {
+        let kvCachePlan = try parameters.kvCachePlan()
+        try self.init(
+            input: input,
+            mainModel: mainModel,
+            drafter: drafter,
+            mainCacheStorage: KVCacheStorage(
+                mainCache ?? (try mainModel.newCache(parameters: parameters)), plan: kvCachePlan),
+            mainState: mainState,
+            mtpContinuation: mtpContinuation,
+            parameters: parameters,
+            blockSize: blockSize,
+            components: components)
+    }
+
     package init(
         input: LMInput,
         mainModel: any LanguageModel,
@@ -971,7 +999,9 @@ package protocol MTPDrafterContinuationProviding {
 }
 
 extension MTPSpeculativeTokenIterator: MTPDrafterContinuationProviding {
-    package var mtpDrafterContinuation: MTPDrafterContinuation? {
+    /// The drafter state finalized at the end of the stream, aligned to the target cache's
+    /// final position; `nil` until generation finishes or when speculation stood down.
+    public var mtpDrafterContinuation: MTPDrafterContinuation? {
         finalizedContinuation
     }
 }
