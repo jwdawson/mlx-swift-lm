@@ -66,6 +66,39 @@ struct MTPContinuationTests {
     }
 
     @Test(arguments: [true, false], [true, false])
+    func prefillOntoAWarmCacheResumesAndMatchesPlainGreedy(
+        hybrid: Bool, agreeable: Bool
+    ) async throws {
+        let fixture = try ContinuationFixture(hybrid: hybrid, agreeable: agreeable)
+        let promptC = [9, 10]
+
+        let cache = try fixture.newCache()
+        let (tokens1, round1) = try await fixture.mtpRound(
+            promptA, cache: cache, state: nil, continuation: nil)
+        let lastToken = try #require(tokens1.last)
+        let prefillInput = [lastToken] + promptB
+        let prefill = try fixture.prefill(
+            prefillInput, cache: cache, state: round1.state, continuation: round1.continuation)
+        #expect(prefill.passthroughReason == nil)
+        let position = promptA.count + tokens1.count - 1 + prefillInput.count
+        #expect(fixture.position(of: cache) == position)
+        #expect(prefill.continuation?.targetProcessedTokenCount == position)
+
+        let (tokens2, round2) = try await fixture.mtpRound(
+            promptC, cache: cache, state: prefill.state, continuation: prefill.continuation)
+        #expect(round2.passthroughReason == nil)
+        #expect(round2.drafted > 0)
+        #expect(!agreeable || round2.accepted > 0)
+
+        // Plain greedy over the same sequence: A, round 1's tokens, B, then C.
+        let plainCache = try fixture.newCache()
+        let plain1 = try await fixture.plainRound(promptA, cache: plainCache)
+        let plain2 = try await fixture.plainRound(promptB + promptC, cache: plainCache)
+        #expect(tokens1 == plain1)
+        #expect(tokens2 == plain2)
+    }
+
+    @Test(arguments: [true, false], [true, false])
     func aCopiedContinuationResumesTheSameAsTheOriginal(
         hybrid: Bool, agreeable: Bool
     ) async throws {

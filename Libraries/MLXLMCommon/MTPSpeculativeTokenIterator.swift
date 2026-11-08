@@ -1001,6 +1001,7 @@ package protocol MTPDrafterContinuationProviding {
 extension MTPSpeculativeTokenIterator: MTPDrafterContinuationProviding {
     /// The drafter state finalized at the end of the stream, aligned to the target cache's
     /// final position; `nil` until generation finishes or when speculation stood down.
+    /// That position excludes the last generated token, which the next round's input must begin with.
     public var mtpDrafterContinuation: MTPDrafterContinuation? {
         finalizedContinuation
     }

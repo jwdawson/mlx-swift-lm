@@ -2684,6 +2684,8 @@ public func generateTokensTask(
 
 /// What one MTP round leaves for the next: the target state and drafter continuation
 /// aligned to the cache's final position, and the round's speculation counts.
+/// The cache ends before the round's last generated token, so the next round's input
+/// must begin with that token (unlike the plain iterator, whose cache already holds it).
 ///
 /// `continuation` is `nil` when speculation stood down (`passthroughReason` says why) or
 /// the drafter keeps no state. Hand both back with the same cache on the next round.
@@ -2732,6 +2734,8 @@ private struct MTPRoundCollector: GeneratedTokenCollector {
 /// finalized against `cache`, for the next round on the same cache. With an empty cache
 /// pass no continuation; a stateful drafter then starts from the prompt. A warm cache
 /// without a continuation aligned to it runs the round without speculation.
+/// The cache ends before the round's last generated token, so the next round's input
+/// must begin with that token (unlike the plain iterator, whose cache already holds it).
 public func generateTokensTask(
     input: LMInput,
     cache: [KVCache],
