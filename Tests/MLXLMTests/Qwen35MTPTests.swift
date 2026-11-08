@@ -595,6 +595,36 @@ struct Qwen35MTPMetalTests {
     }
 
     @Test
+    func qwenHeadSpeculatesAboveTemperatureZero() async throws {
+        let cfg = try JSONDecoder().decode(
+            MLXLLM.Qwen35TextConfiguration.self,
+            from: Data(qwen35TextConfigJSON(mtpLayers: 1).utf8))
+        let target = MLXLLM.Qwen35TextModel(cfg)
+        let tokenizer = ReversibleQwenMTPTokenizer()
+        let processor = ReversibleQwenMTPInputProcessor(tokenizer: tokenizer)
+        let context = ModelContext(
+            configuration: processor.configuration,
+            model: target,
+            processor: processor,
+            tokenizer: tokenizer)
+        let drafterContainer = MTPDrafterContainer(
+            context: MTPDrafterContext(
+                configuration: processor.configuration,
+                model: MLXLLM.Qwen35MTPDraftModel(cfg)))
+        let session = ChatSession(
+            context,
+            speculativeDecoding: try SpeculativeDecodingConfig(
+                mtpDrafter: drafterContainer, blockSize: 2),
+            generateParameters: .init(maxTokens: 8, temperature: 1.0))
+
+        let details = try await collectQwenChatDetails(
+            session.streamDetails(to: tokenizer.text(for: 1)))
+
+        #expect(details.info.passthroughReason == nil)
+        #expect((details.info.proposedDraftTokens ?? 0) > 0)
+    }
+
+    @Test
     func testQwen35VLMChatSessionResumesActualDrafterState() async throws {
         let cfg = try JSONDecoder().decode(
             MLXVLM.Qwen35Configuration.self,
@@ -821,7 +851,7 @@ struct Qwen35MTPRegistrationTests {
         #expect(standalone.maximumBlockSize == 2)
         #expect(standalone.requiresPromptPrefill)
         #expect(!standalone.requiresSharedTargetKV)
-        #expect(standalone.requiresGreedySampling)
+        #expect(!standalone.requiresGreedySampling)
 
         let standaloneVLM = try await MTPDrafterTypeRegistry.visionLanguage.createModel(
             configuration: Data(qwen35StandaloneMTPConfigJSON().utf8),

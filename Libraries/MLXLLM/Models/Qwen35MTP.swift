@@ -74,7 +74,7 @@ public final class Qwen35MTPDraftModel: Module, ResumableMTPDrafterModel {
     public let maximumBlockSize: Int? = 2
     public let requiresSharedTargetKV = false
     public let requiresPromptPrefill = true
-    public let requiresGreedySampling = true
+    public let requiresGreedySampling = false
     private let checkpointPolicy: Qwen35CheckpointPolicy
 
     @ModuleInfo(key: "mtp") var mtp: Qwen35MTPPredictor
