@@ -71,11 +71,12 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
     var processor: LogitProcessor?
     let sampler: LogitSampler
 
-    /// Sampler handed to ``MTPDrafterModel/draftBlock``: the base sampler,
-    /// wrapped to mask suppressed token IDs when the target has any.
-    /// `draftBlock` receives no ``LogitProcessor``, and an unsuppressed
-    /// draft of a suppressed token would always be rejected by the
-    /// verifier, wasting draft slots.
+    /// Sampler handed to the drafter: argmax at any temperature, wrapped to
+    /// mask suppressed token IDs when the target has any. Argmax leaves the
+    /// random stream to the target, and under the match rule it is the best
+    /// guess. The drafter receives no ``LogitProcessor``, and an unsuppressed
+    /// draft of a suppressed token would always be rejected by the verifier,
+    /// wasting draft slots.
     let draftSampler: LogitSampler
 
     public var tokenCount: Int { telemetry.emittedTokenCount }
@@ -242,9 +243,9 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         // ids have to be masked at the drafter's own sampler: a proposal the
         // verifier will always reject is a wasted speculation slot.
         if let suppressor = makeSuppressTokensProcessor(model: mainModel) {
-            self.draftSampler = SuppressTokensSampler(base: self.sampler, suppressor: suppressor)
+            self.draftSampler = SuppressTokensSampler(base: ArgMaxSampler(), suppressor: suppressor)
         } else {
-            self.draftSampler = self.sampler
+            self.draftSampler = ArgMaxSampler()
         }
 
         self.maxTokens = parameters.maxTokens
@@ -478,7 +479,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                 firstBonus: y.tokens,
                 positionDeltas: mainState?[mtpPositionDeltasKey],
                 state: &currentDrafterState,
-                sampler: sampler)
+                sampler: draftSampler)
             guard resumed else {
                 switchToPassthrough(
                     reason:
@@ -507,7 +508,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                 firstBonus: y.tokens,
                 positionDeltas: mainState?[mtpPositionDeltasKey],
                 state: &currentDrafterState,
-                sampler: sampler)
+                sampler: draftSampler)
             drafterState = currentDrafterState
         } else if cachePositionBeforePrefill > 0,
             drafter is any StatefulMTPDrafterModel
@@ -725,7 +726,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                 finalToken: emittedFinalToken,
                 positionDeltas: mainResult.state?[mtpPositionDeltasKey],
                 state: &currentDrafterState,
-                sampler: sampler)
+                sampler: draftSampler)
             drafterState = currentDrafterState
         }
 
@@ -834,7 +835,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                 finalToken: token,
                 positionDeltas: result.state?[mtpPositionDeltasKey],
                 state: &currentDrafterState,
-                sampler: sampler)
+                sampler: draftSampler)
             drafterState = currentDrafterState
             targetBoundaryHidden = targetHidden[0..., (-1)..., 0...]
         } else if maintainingDrafterState,

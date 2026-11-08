@@ -804,6 +804,146 @@ func testQwenStyleMTPRequiresGreedySampling() throws {
     )
 }
 
+// MARK: - Seeded sampling
+
+/// Next-token logits for an 8-token vocabulary, one row per input token. Token 3 leads each
+/// row, so a drafter that proposes 3 is accepted often but not always.
+private let spreadLogitRows: [[Float]] = [
+    [0.2, 1.1, 0.5, 2.0, 0.9, 0.0, 1.4, 0.3],
+    [1.3, 0.1, 0.8, 1.9, 0.4, 1.0, 0.0, 0.6],
+    [0.5, 1.6, 0.2, 2.0, 1.2, 0.3, 0.9, 0.0],
+    [0.0, 0.7, 1.5, 1.8, 0.2, 1.4, 0.6, 1.0],
+    [1.0, 0.3, 0.0, 2.0, 1.5, 0.8, 0.4, 1.2],
+    [0.6, 1.2, 0.9, 1.7, 0.0, 0.5, 1.6, 0.2],
+    [0.4, 0.0, 1.3, 2.0, 0.7, 1.1, 0.2, 1.5],
+    [1.4, 0.9, 0.6, 1.9, 1.0, 0.0, 0.8, 0.5],
+]
+
+/// A target whose logits at each position are the row for that position's input token, so a
+/// speculative run and a plain run see the same distributions wherever they emit the same
+/// tokens. Emits one hidden row per position, and a shared K/V snapshot, when asked for
+/// drafter state.
+private final class SpreadLogitsMainModel: Module, LanguageModel, KVCacheDimensionProvider {
+    var kvHeads: [Int] { [1] }
+
+    func prepare(
+        _ input: LMInput, cache: [KVCache], state _: LMOutput.State?, prefill _: PrefillParameters
+    ) throws -> PrepareResult {
+        .tokens(input.text)
+    }
+
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        logits(for: inputs)
+    }
+
+    func callAsFunction(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        let positions = input.tokens.dim(-1)
+        if let mutable = cache?.first as? MutableOffsetKVCache {
+            mutable.offset += positions
+        }
+        let logits = logits(for: input.tokens)
+        guard state?[mtpEmitFlagKey] ?? false else { return LMOutput(logits: logits) }
+        // The iterator asserts that a snapshot spans what the cache holds.
+        let kvOffset = cache?.first?.offset ?? positions
+        let kv = MLXArray.zeros([1, 1, kvOffset, 4])
+        var out = LMOutput.State()
+        out[mtpLastHiddenStatesKey] = MLXArray.zeros([1, positions, 4])
+        out[mtpSharedKVSourceIndicesKey] = ["full_attention": 0]
+        out[mtpSharedKVStatesKey] = ["full_attention": (kv, kv)]
+        out[mtpSharedKVOffsetsKey] = ["full_attention": kvOffset]
+        return LMOutput(logits: logits, state: out)
+    }
+
+    func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        [CountingKVCache()]
+    }
+
+    private func logits(for tokens: MLXArray) -> MLXArray {
+        let ids = tokens.flattened().asArray(Int.self)
+        return MLXArray(ids.flatMap { spreadLogitRows[$0] }, [1, ids.count, 8])
+    }
+}
+
+/// A stateful drafter that samples its seed and its proposals from fixed spread logits with
+/// whatever sampler the iterator hands it, as the Qwen MTP head does.
+private final class SpreadLogitsDrafter: Module, StatefulMTPDrafterModel {
+    private let logits = MLXArray([0.9, 0.4, 1.2, 2.0, 0.1, 1.5, 0.7, 0.3] as [Float], [1, 8])
+
+    var requiresPromptPrefill: Bool { true }
+
+    func validateCompatibility(with _: any LanguageModel) throws {}
+
+    func makeState(parameters: GenerateParameters?) -> MTPDrafterState {
+        MTPDrafterState(cache: [CountingKVCache()])
+    }
+
+    func prepareDrafterState(
+        target _: any LanguageModel, promptTokens _: MLXArray, targetHidden _: MLXArray,
+        firstBonus _: MLXArray, positionDeltas _: MLXArray?, state: inout MTPDrafterState,
+        sampler: any LogitSampler
+    ) {
+        state.seedToken = sampler.sample(logits: logits)
+    }
+
+    func draftBlock(
+        target: any LanguageModel, lastToken: MLXArray, lastHidden: MLXArray,
+        sharedKV: [String: (MLXArray, MLXArray)], positionDeltas: MLXArray?, queryOffset: Int,
+        blockSize: Int, sampler: any LogitSampler
+    ) -> MLXArray {
+        var state = makeState(parameters: nil)
+        return draftBlock(
+            target: target, lastToken: lastToken, lastHidden: lastHidden, sharedKV: sharedKV,
+            positionDeltas: positionDeltas, queryOffset: queryOffset, blockSize: blockSize,
+            state: &state, sampler: sampler)
+    }
+
+    func draftBlock(
+        target _: any LanguageModel, lastToken _: MLXArray, lastHidden _: MLXArray,
+        sharedKV _: [String: (MLXArray, MLXArray)], positionDeltas _: MLXArray?,
+        queryOffset _: Int, blockSize: Int, state _: inout MTPDrafterState,
+        sampler: any LogitSampler
+    ) -> MLXArray {
+        let drafts = (0 ..< blockSize - 1).map { _ in sampler.sample(logits: logits) }
+        return concatenated(drafts).reshaped([1, blockSize - 1])
+    }
+
+    func commitDrafterState(
+        target _: any LanguageModel, targetHidden _: MLXArray, draftTokens _: MLXArray,
+        acceptedCount _: Int, finalToken _: MLXArray, positionDeltas _: MLXArray?,
+        state: inout MTPDrafterState, sampler: any LogitSampler
+    ) {
+        state.seedToken = sampler.sample(logits: logits)
+    }
+}
+
+/// Acceptance samples the target and keeps a draft only when it matches, so a seeded
+/// speculative run emits a seeded plain run's tokens as long as the target alone draws from
+/// the random stream.
+@Test
+func seededSamplingSpeculationEmitsThePlainRunsTokens() throws {
+    let prompt = MLXArray([Int32(1), 4, 6])
+    // The sampler owns its random state, seeded from the parameters.
+    let parameters = GenerateParameters(maxTokens: 32, temperature: 1.0, seed: 7)
+
+    var iter = try MTPSpeculativeTokenIterator(
+        input: LMInput(tokens: prompt), mainModel: SpreadLogitsMainModel(),
+        drafter: SpreadLogitsDrafter(), mainCache: nil, parameters: parameters, blockSize: 3)
+    var speculative: [Int] = []
+    while let token = iter.next() { speculative.append(token) }
+
+    let plainIterator = try TokenIterator(
+        input: LMInput(tokens: prompt), model: SpreadLogitsMainModel(), parameters: parameters)
+    let plain = Array(plainIterator)
+
+    #expect(speculative.count == 32)
+    #expect(speculative == plain)
+    #expect(iter.passthroughReason == nil)
+    #expect(iter.proposedCount > 0)
+    #expect(iter.acceptedCount > 0)
+}
+
 // MARK: - sharedKV span across partial acceptance
 
 /// The drafter-conditioning observable that output-equivalence testing
