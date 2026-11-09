@@ -64,11 +64,12 @@ let package = Package(
         .default(enabledTraits: ["FoundationModelsIntegration"]),
     ],
     dependencies: [
-        // 0.33.0 plus MLXFast in the Linux CPU-only (SPM_CUDA=0) build and the split-D NAX
-        // attention JIT fix (jwdawson/mlx nax-dsplit-jit).
+        // 0.33.0 plus MLXFast in the Linux CPU-only (SPM_CUDA=0) build, the split-D NAX
+        // attention JIT fix and one K/V read for 2-8 query attention (jwdawson/mlx
+        // sdpa-vector-mma).
         .package(
             url: "https://github.com/jwdawson/mlx-swift",
-            revision: "620dd553ad05857246a5d4288c2ebeab4ef79150"),
+            revision: "60683a4a6cfe36abf8de97151bbf4e0fc767cfa7"),
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
         // source compile of swift-syntax.
