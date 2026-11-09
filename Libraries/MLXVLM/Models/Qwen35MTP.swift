@@ -81,7 +81,7 @@ final class Qwen35VLMNextNPredictor: Module {
 
 public final class Qwen35VLMNextNDraftModel: Module, ResumableMTPDrafterModel {
     public let configuration: Qwen35Configuration.TextConfiguration
-    public let maximumBlockSize: Int? = 2
+    public let maximumBlockSize: Int? = 5
     public let requiresSharedTargetKV = false
     public let requiresPromptPrefill = true
     public let requiresGreedySampling = false
@@ -278,10 +278,33 @@ public final class Qwen35VLMNextNDraftModel: Module, ResumableMTPDrafterModel {
         let lmHead = target.languageModel.lmHead
 
         if let seed = state.seedToken {
+            let seedHidden = state.seedHidden
             state.seedToken = nil
             state.seedHidden = nil
             state.proposalAppended = 0
-            return seed
+            guard blockSize > 2, let seedHidden else { return seed }
+            // Chain past the seed from its own hidden state; commit trims the rejected entries.
+            let chained = draftMTPTokenBlock(
+                targetEmbedTokens: targetEmbedTokens,
+                lmHead: lmHead,
+                inputEmbedding: inputEmbedding,
+                lastToken: seed,
+                lastHidden: seedHidden,
+                queryOffset: state.nextPosition,
+                blockSize: blockSize - 1,
+                sampler: sampler,
+                cache: state.cache
+            ) { inputsEmbeds, hiddenStates, cache, positionOffset in
+                mtp(
+                    inputsEmbeds: inputsEmbeds,
+                    hiddenStates: hiddenStates,
+                    cache: cache,
+                    positionOffset: positionOffset,
+                    positionDeltas: positionDeltas)
+            }
+            state.proposalAppended = blockSize - 2
+            state.nextPosition += state.proposalAppended
+            return concatenated([seed, chained], axis: 1)
         }
 
         state.proposalAppended = blockSize - 1

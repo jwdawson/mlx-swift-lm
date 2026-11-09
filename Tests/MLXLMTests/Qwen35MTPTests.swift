@@ -354,8 +354,10 @@ struct Qwen35MTPMetalTests {
         #expect(!allClose(emitted, expected, rtol: 0, atol: 0).item(Bool.self))
     }
 
-    @Test
-    func testQwen35DrafterCacheTracksVerifiedSequenceAcrossAcceptRejectPatterns() throws {
+    @Test(arguments: [2, 4])
+    func testQwen35DrafterCacheTracksVerifiedSequenceAcrossAcceptRejectPatterns(
+        blockSize: Int
+    ) throws {
         let cfg = try JSONDecoder().decode(
             MLXLLM.Qwen35TextConfiguration.self,
             from: Data(qwen35TextConfigJSON(mtpLayers: 1).utf8))
@@ -363,13 +365,16 @@ struct Qwen35MTPMetalTests {
         let drafter = MLXLLM.Qwen35MTPDraftModel(cfg)
         let sampler = GenerateParameters(temperature: 0).sampler()
         let prompt = MLXArray([Int32(1), 2, 3]).reshaped([1, 3])
+        let numDraft = blockSize - 1
 
         var targetState = LMOutput.State()
         targetState[mtpEmitFlagKey] = true
         let targetOutput = target(LMInput.Text(tokens: prompt), cache: nil, state: targetState)
         let promptHidden = try #require(targetOutput.state?[mtpLastHiddenStatesKey])
 
-        for pattern in [[0, 0], [0, 1], [1, 0], [1, 1]] {
+        let counts = Array(0 ... numDraft)
+        let patterns = counts.flatMap { first in counts.map { [first, $0] } }
+        for pattern in patterns {
             var state = drafter.makeState(parameters: nil)
             var bonus = MLXArray([Int32(4)])
             drafter.prepareDrafterState(
@@ -384,12 +389,16 @@ struct Qwen35MTPMetalTests {
                 let proposal = drafter.draftBlock(
                     target: target, lastToken: bonus,
                     lastHidden: promptHidden[0..., (-1)..., 0...], sharedKV: [:],
-                    positionDeltas: nil, queryOffset: expectedPosition, blockSize: 2,
+                    positionDeltas: nil, queryOffset: expectedPosition, blockSize: blockSize,
                     state: &state, sampler: sampler)
                 eval(proposal)
-                #expect(state.cache.allSatisfy { $0.offset == expectedPosition })
+                // The seed is waiting; the chained tokens after it each add a drafter entry.
+                #expect(proposal.dim(1) == numDraft)
+                #expect(state.proposalAppended == numDraft - 1)
+                #expect(state.nextPosition == expectedPosition + numDraft - 1)
+                #expect(state.cache.allSatisfy { $0.offset == state.nextPosition })
 
-                let verifyHidden = MLXArray.zeros([1, 2, cfg.hiddenSize])
+                let verifyHidden = MLXArray.zeros([1, blockSize, cfg.hiddenSize])
                 let finalToken = MLXArray([Int32(8 + accepted)])
                 drafter.commitDrafterState(
                     target: target, targetHidden: verifyHidden, draftTokens: proposal,
@@ -399,13 +408,17 @@ struct Qwen35MTPMetalTests {
                 expectedPosition += accepted + 1
                 #expect(state.cache.allSatisfy { $0.offset == expectedPosition })
                 #expect(state.nextPosition == expectedPosition)
+                #expect(state.proposalAppended == 0)
                 bonus = finalToken
             }
         }
     }
 
-    @Test
-    func testQwen35TextDrafterFinalizesAndResumesCanonicalBoundary() throws {
+    /// `accepted` of the round's drafts are kept; the drafter ends at prompt + bonus + accepted + final.
+    @Test(arguments: [(2, 1), (4, 1), (4, 2), (4, 3)])
+    func testQwen35TextDrafterFinalizesAndResumesCanonicalBoundary(
+        blockSize: Int, accepted: Int
+    ) throws {
         let cfg = try JSONDecoder().decode(
             MLXLLM.Qwen35TextConfiguration.self,
             from: Data(qwen35TextConfigJSON(mtpLayers: 1).utf8))
@@ -427,26 +440,28 @@ struct Qwen35MTPMetalTests {
         let proposal = drafter.draftBlock(
             target: target, lastToken: bonus,
             lastHidden: promptHidden[0..., (-1)..., 0...], sharedKV: [:],
-            positionDeltas: nil, queryOffset: 3, blockSize: 2,
+            positionDeltas: nil, queryOffset: 3, blockSize: blockSize,
             state: &state, sampler: sampler)
-        let verifyHidden = MLXArray.zeros([1, 2, cfg.hiddenSize])
+        #expect(proposal.dim(1) == blockSize - 1)
+        let verifyHidden = MLXArray.zeros([1, blockSize, cfg.hiddenSize])
         bonus = MLXArray([Int32(5)])
         drafter.commitDrafterState(
             target: target, targetHidden: verifyHidden, draftTokens: proposal,
-            acceptedCount: 1, finalToken: bonus, positionDeltas: nil,
+            acceptedCount: accepted, finalToken: bonus, positionDeltas: nil,
             state: &state, sampler: sampler)
         eval(state.seedToken!, state.seedHidden!)
-        #expect(state.nextPosition == 5)
-        #expect(state.cache.allSatisfy { $0.offset == 5 })
+        let processed = 4 + accepted
+        #expect(state.nextPosition == processed)
+        #expect(state.cache.allSatisfy { $0.offset == processed })
 
-        let boundaryHidden = verifyHidden[0..., 1 ..< 2, 0...]
+        let boundaryHidden = verifyHidden[0..., accepted ..< (accepted + 1), 0...]
         #expect(
             drafter.finalizeDrafterState(
                 target: target, targetBoundaryHidden: boundaryHidden,
-                targetProcessedTokenCount: 5, discardedTargetTokens: 0,
+                targetProcessedTokenCount: processed, discardedTargetTokens: 0,
                 positionDeltas: nil, state: &state))
-        #expect(state.nextPosition == 4)
-        #expect(state.cache.allSatisfy { $0.offset == 4 })
+        #expect(state.nextPosition == processed - 1)
+        #expect(state.cache.allSatisfy { $0.offset == processed - 1 })
         #expect(state.seedToken == nil)
         #expect(state.seedHidden == nil)
 
@@ -460,12 +475,15 @@ struct Qwen35MTPMetalTests {
                 firstBonus: MLXArray([Int32(8)]), positionDeltas: nil,
                 state: &state, sampler: sampler))
         eval(state.seedToken!, state.seedHidden!)
-        #expect(state.nextPosition == 7)
-        #expect(state.cache.allSatisfy { $0.offset == 7 })
+        #expect(state.nextPosition == processed + 2)
+        #expect(state.cache.allSatisfy { $0.offset == processed + 2 })
     }
 
-    @Test
-    func testQwen35TextDrafterFinalizationAlsoDiscardsTargetLookahead() throws {
+    /// The target processed the verify's kept rows but `discarded` of them were never emitted.
+    @Test(arguments: [(2, 1, 1), (4, 2, 1), (4, 2, 2), (4, 3, 3)])
+    func testQwen35TextDrafterFinalizationAlsoDiscardsTargetLookahead(
+        blockSize: Int, accepted: Int, discarded: Int
+    ) throws {
         let cfg = try JSONDecoder().decode(
             MLXLLM.Qwen35TextConfiguration.self,
             from: Data(qwen35TextConfigJSON(mtpLayers: 1).utf8))
@@ -482,23 +500,25 @@ struct Qwen35MTPMetalTests {
         let proposal = drafter.draftBlock(
             target: target, lastToken: MLXArray([Int32(4)]),
             lastHidden: hidden[0..., (-1)..., 0...], sharedKV: [:],
-            positionDeltas: nil, queryOffset: 3, blockSize: 2,
+            positionDeltas: nil, queryOffset: 3, blockSize: blockSize,
             state: &state, sampler: sampler)
-        let verifyHidden = MLXArray.zeros([1, 2, cfg.hiddenSize])
+        let verifyHidden = MLXArray.zeros([1, blockSize, cfg.hiddenSize])
         drafter.commitDrafterState(
             target: target, targetHidden: verifyHidden, draftTokens: proposal,
-            acceptedCount: 1, finalToken: MLXArray([Int32(5)]),
+            acceptedCount: accepted, finalToken: MLXArray([Int32(5)]),
             positionDeltas: nil, state: &state, sampler: sampler)
 
-        #expect(state.nextPosition == 5)
+        let processed = 4 + accepted - discarded
+        #expect(state.nextPosition == 4 + accepted)
+        let keptRow = accepted - discarded
         #expect(
             drafter.finalizeDrafterState(
                 target: target,
-                targetBoundaryHidden: verifyHidden[0..., ..<1, 0...],
-                targetProcessedTokenCount: 4, discardedTargetTokens: 1,
+                targetBoundaryHidden: verifyHidden[0..., keptRow ..< (keptRow + 1), 0...],
+                targetProcessedTokenCount: processed, discardedTargetTokens: discarded,
                 positionDeltas: nil, state: &state))
-        #expect(state.nextPosition == 3)
-        #expect(state.cache.allSatisfy { $0.offset == 3 })
+        #expect(state.nextPosition == processed - 1)
+        #expect(state.cache.allSatisfy { $0.offset == processed - 1 })
     }
 
     @Test
@@ -541,8 +561,18 @@ struct Qwen35MTPMetalTests {
         #expect(state.cache.allSatisfy { $0.offset == 5 })
     }
 
-    @Test
-    func testQwen35TextChatSessionResumesActualDrafterState() async throws {
+    @Test(arguments: 2 ... 5)
+    func testQwen35TextChatSessionResumesActualDrafterState(blockSize: Int) async throws {
+        try await assertQwen35TextChatSessionResumes(blockSize: blockSize, maxTokens: 8)
+    }
+
+    /// `maxTokens` ends inside a block, so the last rounds draft fewer than the block allows.
+    @Test(arguments: [3, 6])
+    func testQwen35TextChatSessionEndsMidBlock(maxTokens: Int) async throws {
+        try await assertQwen35TextChatSessionResumes(blockSize: 5, maxTokens: maxTokens)
+    }
+
+    private func assertQwen35TextChatSessionResumes(blockSize: Int, maxTokens: Int) async throws {
         let cfg = try JSONDecoder().decode(
             MLXLLM.Qwen35TextConfiguration.self,
             from: Data(qwen35TextConfigJSON(mtpLayers: 1).utf8))
@@ -561,11 +591,11 @@ struct Qwen35MTPMetalTests {
         let speculative = ChatSession(
             context,
             speculativeDecoding: try SpeculativeDecodingConfig(
-                mtpDrafter: drafterContainer, blockSize: 2),
-            generateParameters: .init(maxTokens: 4, temperature: 0))
+                mtpDrafter: drafterContainer, blockSize: blockSize),
+            generateParameters: .init(maxTokens: maxTokens, temperature: 0))
         let targetOnly = ChatSession(
             context,
-            generateParameters: .init(maxTokens: 4, temperature: 0))
+            generateParameters: .init(maxTokens: maxTokens, temperature: 0))
 
         let firstPrompt = tokenizer.text(for: 1)
         let secondPrompt = tokenizer.text(for: 2)
@@ -592,10 +622,14 @@ struct Qwen35MTPMetalTests {
         #expect(forkSecond.info.cachedPromptTokenCount > 0)
         #expect((forkSecond.info.proposedDraftTokens ?? 0) > 0)
         #expect(forkSecond.info.passthroughReason == nil)
+        if maxTokens >= 4 {
+            try expectDraftsPastSeed(speculativeFirst.info, blockSize: blockSize)
+            try expectDraftsPastSeed(speculativeSecond.info, blockSize: blockSize)
+        }
     }
 
-    @Test
-    func qwenHeadSpeculatesAboveTemperatureZero() async throws {
+    @Test(arguments: 2 ... 5)
+    func qwenHeadSpeculatesAboveTemperatureZero(blockSize: Int) async throws {
         let cfg = try JSONDecoder().decode(
             MLXLLM.Qwen35TextConfiguration.self,
             from: Data(qwen35TextConfigJSON(mtpLayers: 1).utf8))
@@ -611,21 +645,29 @@ struct Qwen35MTPMetalTests {
             context: MTPDrafterContext(
                 configuration: processor.configuration,
                 model: MLXLLM.Qwen35MTPDraftModel(cfg)))
+        let parameters = GenerateParameters(maxTokens: 8, temperature: 1.0, seed: 31)
         let session = ChatSession(
             context,
             speculativeDecoding: try SpeculativeDecodingConfig(
-                mtpDrafter: drafterContainer, blockSize: 2),
-            generateParameters: .init(maxTokens: 8, temperature: 1.0))
+                mtpDrafter: drafterContainer, blockSize: blockSize),
+            generateParameters: parameters)
+        let plain = ChatSession(context, generateParameters: parameters)
 
+        // Acceptance compares the draft with the target's own sample, so a seeded run
+        // draws the same samples as the plain run.
         let details = try await collectQwenChatDetails(
             session.streamDetails(to: tokenizer.text(for: 1)))
+        let plainDetails = try await collectQwenChatDetails(
+            plain.streamDetails(to: tokenizer.text(for: 1)))
 
+        #expect(details.text == plainDetails.text)
         #expect(details.info.passthroughReason == nil)
         #expect((details.info.proposedDraftTokens ?? 0) > 0)
+        try expectDraftsPastSeed(details.info, blockSize: blockSize)
     }
 
-    @Test
-    func testQwen35VLMChatSessionResumesActualDrafterState() async throws {
+    @Test(arguments: 2 ... 5)
+    func testQwen35VLMChatSessionResumesActualDrafterState(blockSize: Int) async throws {
         let cfg = try JSONDecoder().decode(
             MLXVLM.Qwen35Configuration.self,
             from: Data(qwen35VLMConfigJSON(mtpLayers: 1).utf8))
@@ -644,11 +686,11 @@ struct Qwen35MTPMetalTests {
         let speculative = ChatSession(
             context,
             speculativeDecoding: try SpeculativeDecodingConfig(
-                mtpDrafter: drafterContainer, blockSize: 2),
-            generateParameters: .init(maxTokens: 4, temperature: 0))
+                mtpDrafter: drafterContainer, blockSize: blockSize),
+            generateParameters: .init(maxTokens: 8, temperature: 0))
         let targetOnly = ChatSession(
             context,
-            generateParameters: .init(maxTokens: 4, temperature: 0))
+            generateParameters: .init(maxTokens: 8, temperature: 0))
 
         let firstPrompt = tokenizer.text(for: 1)
         let secondPrompt = tokenizer.text(for: 2)
@@ -667,6 +709,21 @@ struct Qwen35MTPMetalTests {
         #expect(speculativeSecond.info.cachedPromptTokenCount > 0)
         #expect((speculativeSecond.info.proposedDraftTokens ?? 0) > 0)
         #expect(speculativeSecond.info.passthroughReason == nil)
+        try expectDraftsPastSeed(speculativeFirst.info, blockSize: blockSize)
+        try expectDraftsPastSeed(speculativeSecond.info, blockSize: blockSize)
+    }
+
+    /// Above block 2 a round drafts the seed plus chained tokens, so the mean exceeds one.
+    private func expectDraftsPastSeed(_ info: GenerateCompletionInfo, blockSize: Int) throws {
+        let telemetry = try #require(info.speculativeDecodingTelemetry)
+        let perRound = Double(telemetry.draftTokenCount) / Double(max(telemetry.roundCount, 1))
+        if blockSize >= 3 {
+            #expect(
+                perRound > 1,
+                "drafted \(telemetry.draftTokenCount) in \(telemetry.roundCount) rounds")
+        } else {
+            #expect(perRound == 1)
+        }
     }
 
     @Test
@@ -929,7 +986,7 @@ struct Qwen35MTPRegistrationTests {
             configuration: Data(qwen35StandaloneMTPConfigJSON().utf8),
             modelType: "qwen3_5_mtp")
         #expect(standalone is MLXLLM.Qwen35MTPDraftModel)
-        #expect(standalone.maximumBlockSize == 2)
+        #expect(standalone.maximumBlockSize == 5)
         #expect(standalone.requiresPromptPrefill)
         #expect(!standalone.requiresSharedTargetKV)
         #expect(!standalone.requiresGreedySampling)
