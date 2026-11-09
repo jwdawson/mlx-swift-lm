@@ -443,9 +443,9 @@ public let mtpEmitFlagKey = LMOutput.Key<Bool>("mtp.emitDrafterState")
 /// the target's ordinary MTP hidden-state behavior.
 public let mtpTargetLayerIdsKey = LMOutput.Key<[Int]>("mtp.targetLayerIds")
 
-/// Requests a recurrent-cache checkpoint after this many verification input
-/// tokens. Hybrid Qwen models use `1` for MTP-1 so a rejected draft restores
-/// state after the always-committed bonus token without replaying the model.
+/// Requests recurrent-cache checkpoints after each of the first `N` verification
+/// input tokens. Hybrid Qwen models use the draft count, so a round that accepts
+/// any prefix of the drafts restores its state without replaying the model.
 public let mtpCacheCheckpointIndexKey =
     LMOutput.Key<Int>("mtp.cacheCheckpointIndex")
 

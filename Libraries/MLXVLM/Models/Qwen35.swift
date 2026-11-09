@@ -765,11 +765,14 @@ public enum Qwen35Language {
                     cache[0] = result.convState
                 }
                 cache[1] = result.recurrentState
-                if let checkpoint = result.checkpoint, let checkpointAfter {
-                    cache.saveSpeculativeCheckpoint(
-                        convState: checkpoint.conv,
-                        recurrentState: checkpoint.recurrent,
-                        advancedBy: checkpointAfter)
+                if !result.checkpoints.isEmpty {
+                    cache.discardSpeculativeCheckpoint()
+                    for (index, checkpoint) in result.checkpoints.enumerated() {
+                        cache.saveSpeculativeCheckpoint(
+                            convState: checkpoint.conv,
+                            recurrentState: checkpoint.recurrent,
+                            advancedBy: index + 1)
+                    }
                 }
                 cache.advance(inputs.dim(1))
             }
@@ -796,7 +799,7 @@ public enum Qwen35Language {
             output: MLXArray,
             convState: MLXArray,
             recurrentState: MLXArray,
-            checkpoint: (conv: MLXArray, recurrent: MLXArray)?
+            checkpoints: [(conv: MLXArray, recurrent: MLXArray)]
         ) {
             let B = x.dim(0)
             let S = x.dim(1)
@@ -835,45 +838,46 @@ public enum Qwen35Language {
 
             let out: MLXArray
             let newRecState: MLXArray
-            let checkpoint: (conv: MLXArray, recurrent: MLXArray)?
-            if let split = checkpointAfter, split > 0, split < S {
-                let prefixMask = mask.map { $0[0..., ..<split] }
-                let suffixMask = mask.map { $0[0..., split...] }
-                let (prefixOut, prefixState) = gatedDeltaUpdate(
-                    q: qNormed[0..., ..<split, 0..., 0...],
-                    k: kNormed[0..., ..<split, 0..., 0...],
-                    v: v[0..., ..<split, 0..., 0...],
-                    a: a[0..., ..<split, 0...],
-                    b: b[0..., ..<split, 0...],
-                    aLog: aLog,
-                    dtBias: dtBias,
-                    state: recState,
-                    mask: prefixMask,
-                    useKernel: !training)
-                let (suffixOut, suffixState) = gatedDeltaUpdate(
-                    q: qNormed[0..., split..., 0..., 0...],
-                    k: kNormed[0..., split..., 0..., 0...],
-                    v: v[0..., split..., 0..., 0...],
-                    a: a[0..., split..., 0...],
-                    b: b[0..., split..., 0...],
-                    aLog: aLog,
-                    dtBias: dtBias,
-                    state: prefixState,
-                    mask: suffixMask,
-                    useKernel: !training)
-                out = concatenated([prefixOut, suffixOut], axis: 1)
-                newRecState = suffixState
-
-                let checkpointConv: MLXArray
-                if convKernelSize > 1 {
-                    checkpointConv = contiguous(
-                        convInput[
-                            0..., split ..< (split + convKernelSize - 1), 0...])
-                } else {
-                    checkpointConv = MLXArray.zeros(
-                        [B, 0, convDim], dtype: mixedQKV.dtype)
+            let checkpoints: [(conv: MLXArray, recurrent: MLXArray)]
+            if let last = checkpointAfter, last > 0, S > 1 {
+                // Run the gated-delta update once per part so the state after each of
+                // positions 1…last is available; projections and conv ran once above.
+                let splits = Array(1 ... min(last, S - 1))
+                let bounds = [0] + splits + [S]
+                var outs: [MLXArray] = []
+                var states: [MLXArray] = []
+                var state = recState
+                for (start, end) in zip(bounds, bounds.dropFirst()) {
+                    let (partOut, partState) = gatedDeltaUpdate(
+                        q: qNormed[0..., start ..< end, 0..., 0...],
+                        k: kNormed[0..., start ..< end, 0..., 0...],
+                        v: v[0..., start ..< end, 0..., 0...],
+                        a: a[0..., start ..< end, 0...],
+                        b: b[0..., start ..< end, 0...],
+                        aLog: aLog,
+                        dtBias: dtBias,
+                        state: state,
+                        mask: mask.map { $0[0..., start ..< end] },
+                        useKernel: !training)
+                    outs.append(partOut)
+                    states.append(partState)
+                    state = partState
                 }
-                checkpoint = (checkpointConv, prefixState)
+                out = concatenated(outs, axis: 1)
+                newRecState = states.removeLast()
+
+                if convKernelSize > 1 {
+                    checkpoints = zip(splits, states).map { split, state in
+                        (
+                            contiguous(
+                                convInput[0..., split ..< (split + convKernelSize - 1), 0...]),
+                            state
+                        )
+                    }
+                } else {
+                    let conv = MLXArray.zeros([B, 0, convDim], dtype: mixedQKV.dtype)
+                    checkpoints = states.map { (conv, $0) }
+                }
             } else {
                 (out, newRecState) = gatedDeltaUpdate(
                     q: qNormed,
@@ -886,12 +890,12 @@ public enum Qwen35Language {
                     state: recState,
                     mask: mask,
                     useKernel: !training)
-                checkpoint = nil
+                checkpoints = []
             }
 
             let gated = norm(out, gate: z)
             return (
-                outProj(gated.reshaped(B, S, -1)), newConvState, newRecState, checkpoint
+                outProj(gated.reshaped(B, S, -1)), newConvState, newRecState, checkpoints
             )
         }
     }
@@ -2079,7 +2083,7 @@ extension Qwen35: ModelComponentsProviding {
 }
 
 extension Qwen35: SpeculativeCacheRewindModel {
-    public var maximumNativeTargetCacheRewind: Int { 1 }
+    public var maximumNativeTargetCacheRewind: Int { 4 }
 }
 
 extension Array where Element == THW {

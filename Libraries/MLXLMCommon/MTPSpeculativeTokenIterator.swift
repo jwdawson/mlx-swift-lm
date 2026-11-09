@@ -657,7 +657,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         let verifyTokens = concatenated([bonusToken, flatDraftTokens])
         let verifyInput = LMInput.Text(tokens: verifyTokens)
         let verifyStart = verifyInput.tokens.dim(0) - (numDraft + 1)
-        verifyState[mtpCacheCheckpointIndexKey] = nativeHybridRewind ? 1 : nil
+        verifyState[mtpCacheCheckpointIndexKey] = nativeHybridRewind ? numDraft : nil
         let verifyCache = nativeHybridRewind ? mainCache : round!.caches
         let mainResult = mainModel(
             verifyInput[text: .newAxis], cache: verifyCache, state: verifyState)
@@ -743,8 +743,8 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                     "Target advertised native speculative rewind depth \(nativeRewindDepth), but rewound \(rewound) of \(rejected) positions"
                 )
                 // Rewind attention and recurrent state together. Checkpointed
-                // recurrent caches restore an atomic step; bounded trimmable
-                // recurrent caches can discard a wider rejected suffix.
+                // recurrent caches restore the state after the last kept position;
+                // bounded trimmable recurrent caches trim the rejected suffix.
                 mainCacheStorage.commitProcessedTokens(accepted + 1)
             }
             snapshotPlaced = reconcileSharedKVState(

@@ -1803,43 +1803,53 @@ public class MambaCache: ArraysCache {
         var lengths: MLXArray?
     }
 
-    private var speculativeCheckpoint: SpeculativeCheckpoint?
+    /// One checkpoint per split of the verify pass, in order. A pass of `S`
+    /// tokens checkpoints after positions 1…S-1, so the last is one before the end.
+    private var speculativeCheckpoints: [SpeculativeCheckpoint] = []
 
     public init(leftPadding: [Int]? = nil) {
         super.init(size: 2, leftPadding: leftPadding)
     }
 
-    /// Save the recurrent state at the last unconditionally committed token
-    /// inside a speculative verification pass.
+    /// Save the recurrent state after `tokenCount` tokens of a speculative
+    /// verification pass. Call once per split, in order.
     package func saveSpeculativeCheckpoint(
         convState: MLXArray,
         recurrentState: MLXArray,
         advancedBy tokenCount: Int
     ) {
-        speculativeCheckpoint = SpeculativeCheckpoint(
-            state: [convState, recurrentState],
-            offset: offset,
-            leftPadding: leftPadding.map { $0 - tokenCount },
-            lengths: lengths.map { $0 - tokenCount })
+        speculativeCheckpoints.append(
+            SpeculativeCheckpoint(
+                state: [convState, recurrentState],
+                offset: offset,
+                leftPadding: leftPadding.map { $0 - tokenCount },
+                lengths: lengths.map { $0 - tokenCount }))
+    }
+
+    package var speculativeCheckpointCount: Int {
+        speculativeCheckpoints.count
     }
 
     package var hasSpeculativeCheckpoint: Bool {
-        speculativeCheckpoint != nil
+        !speculativeCheckpoints.isEmpty
     }
 
+    /// Restore the state as it was `n` positions before the end of the verify
+    /// write, and drop every checkpoint.
     @discardableResult
-    package func restoreSpeculativeCheckpoint() -> Bool {
-        guard let checkpoint = speculativeCheckpoint else { return false }
+    package func restoreSpeculativeCheckpoint(rewinding n: Int) -> Bool {
+        guard n > 0, n <= speculativeCheckpoints.count else { return false }
+        let checkpoint = speculativeCheckpoints[speculativeCheckpoints.count - n]
         cache = checkpoint.state
         offset = checkpoint.offset
         leftPadding = checkpoint.leftPadding
         lengths = checkpoint.lengths
-        speculativeCheckpoint = nil
+        speculativeCheckpoints = []
         return true
     }
 
     package func discardSpeculativeCheckpoint() {
-        speculativeCheckpoint = nil
+        speculativeCheckpoints = []
     }
 
     public override func copy() -> any KVCache {
@@ -2677,7 +2687,7 @@ private func canRewindConvolutionCache(_ cache: KVCache, positions: Int) -> Bool
 
 /// Rewind a speculative tail in a hybrid attention/recurrent cache.
 /// Attention entries trim normally; Mamba entries restore the checkpoint the
-/// model captured after the round's committed bonus token.
+/// model captured `numTokens` positions before the end of the verify write.
 @discardableResult
 package func rewindSpeculativePromptCache(
     _ cache: [KVCache], numTokens: Int
@@ -2688,11 +2698,9 @@ package func rewindSpeculativePromptCache(
                 return entry.offset >= numTokens
                     && canRewindConvolutionCache(entry, positions: numTokens)
             }
-            // A recurrent checkpoint records one atomic verify step. Models
-            // that support wider rollback use bounded trimmable recurrent
-            // caches (for example LFM's RewindableConvolutionCache).
-            return numTokens == 1
-                && (entry as? MambaCache)?.hasSpeculativeCheckpoint == true
+            // Recurrent caches hold one checkpoint per verify position, so
+            // they rewind at most that many tokens.
+            return numTokens <= (entry as? MambaCache)?.speculativeCheckpointCount ?? 0
         })
     else { return 0 }
 
@@ -2702,7 +2710,8 @@ package func rewindSpeculativePromptCache(
                 preconditionFailure("Speculative cache validation and rewind diverged")
             }
         } else {
-            guard (entry as? MambaCache)?.restoreSpeculativeCheckpoint() == true else {
+            guard (entry as? MambaCache)?.restoreSpeculativeCheckpoint(rewinding: numTokens) == true
+            else {
                 preconditionFailure("Missing recurrent speculative checkpoint")
             }
         }

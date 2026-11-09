@@ -675,31 +675,33 @@ struct Qwen35MTPMetalTests {
             MLXLLM.Qwen35TextConfiguration.self,
             from: Data(qwen35TextConfigJSON(mtpLayers: 1).utf8))
         let layer = MLXLLM.Qwen35GatedDeltaNet(cfg)
-        let input = MLXRandom.normal([1, 2, 16])
-        let fullCache = MambaCache()
-        let speculativeCache = MambaCache()
-        let prefixCache = MambaCache()
+        let input = MLXRandom.normal([1, 5, 16])
+        let full = layer(input, cache: MambaCache())
 
-        let full = layer(input, cache: fullCache)
-        let speculative = layer(input, cache: speculativeCache, checkpointAfter: 1)
-        _ = layer(input[0..., ..<1, 0...], cache: prefixCache)
-        eval(full, speculative)
+        for position in 1 ... 4 {
+            let speculativeCache = MambaCache()
+            let prefixCache = MambaCache()
+            let speculative = layer(input, cache: speculativeCache, checkpointAfter: 4)
+            _ = layer(input[0..., ..<position, 0...], cache: prefixCache)
+            eval(full, speculative)
 
-        #expect(allClose(speculative, full, rtol: 1e-5, atol: 1e-5).item(Bool.self))
-        #expect(speculativeCache.hasSpeculativeCheckpoint)
-        #expect(speculativeCache.restoreSpeculativeCheckpoint())
+            #expect(allClose(speculative, full, rtol: 1e-5, atol: 1e-5).item(Bool.self))
+            #expect(speculativeCache.hasSpeculativeCheckpoint)
+            #expect(speculativeCache.restoreSpeculativeCheckpoint(rewinding: 5 - position))
+            #expect(!speculativeCache.hasSpeculativeCheckpoint)
 
-        let restored = speculativeCache.state
-        let expected = prefixCache.state
-        #expect(restored.count == expected.count)
-        for (actual, reference) in zip(restored, expected) {
-            eval(actual, reference)
-            // The checkpoint and the prefix run reach the same state through
-            // differently shaped matmuls, so the bound follows the machine's
-            // float32 matmul precision; see MatmulPrecision.
-            #expect(
-                allClose(actual, reference, rtol: gdnStateTolerance, atol: gdnStateTolerance)
-                    .item(Bool.self))
+            let restored = speculativeCache.state
+            let expected = prefixCache.state
+            #expect(restored.count == expected.count)
+            for (actual, reference) in zip(restored, expected) {
+                eval(actual, reference)
+                // The checkpoint and the prefix run reach the same state through
+                // differently shaped matmuls, so the bound follows the machine's
+                // float32 matmul precision; see MatmulPrecision.
+                #expect(
+                    allClose(actual, reference, rtol: gdnStateTolerance, atol: gdnStateTolerance)
+                        .item(Bool.self))
+            }
         }
     }
 
@@ -709,19 +711,77 @@ struct Qwen35MTPMetalTests {
             MLXVLM.Qwen35Configuration.TextConfiguration.self,
             from: Data(qwen35TextConfigJSON(mtpLayers: 1).utf8))
         let layer = MLXVLM.Qwen35Language.GatedDeltaNet(cfg)
-        let input = MLXRandom.normal([1, 2, 16])
-        let fullCache = MambaCache()
-        let speculativeCache = MambaCache()
-        let prefixCache = MambaCache()
+        let input = MLXRandom.normal([1, 5, 16])
+        let full = layer(input, cache: MambaCache())
 
-        let full = layer(input, cache: fullCache)
-        let speculative = layer(input, cache: speculativeCache, checkpointAfter: 1)
-        _ = layer(input[0..., ..<1, 0...], cache: prefixCache)
-        eval(full, speculative)
+        for position in 1 ... 4 {
+            let speculativeCache = MambaCache()
+            let prefixCache = MambaCache()
+            let speculative = layer(input, cache: speculativeCache, checkpointAfter: 4)
+            _ = layer(input[0..., ..<position, 0...], cache: prefixCache)
+            eval(full, speculative)
 
-        #expect(allClose(speculative, full, rtol: 1e-5, atol: 1e-5).item(Bool.self))
-        #expect(speculativeCache.restoreSpeculativeCheckpoint())
-        for (actual, reference) in zip(speculativeCache.state, prefixCache.state) {
+            #expect(allClose(speculative, full, rtol: 1e-5, atol: 1e-5).item(Bool.self))
+            #expect(speculativeCache.restoreSpeculativeCheckpoint(rewinding: 5 - position))
+            let restored = speculativeCache.state
+            #expect(restored.count == prefixCache.state.count)
+            for (actual, reference) in zip(restored, prefixCache.state) {
+                eval(actual, reference)
+                #expect(
+                    allClose(actual, reference, rtol: gdnStateTolerance, atol: gdnStateTolerance)
+                        .item(Bool.self))
+            }
+        }
+    }
+
+    @Test(arguments: (1 ... 4).flatMap { depth in (0 ... depth).map { (depth, $0) } })
+    func hybridCacheRewindsAnyAcceptedPrefix(depth: Int, accepted: Int) throws {
+        let cfg = try JSONDecoder().decode(
+            MLXLLM.Qwen35TextConfiguration.self,
+            from: Data(qwen35TextConfigJSON(mtpLayers: 1).utf8))
+        let layer = MLXLLM.Qwen35GatedDeltaNet(cfg)
+        let prompt = MLXRandom.normal([1, 3, 16])
+        let verify = MLXRandom.normal([1, depth + 1, 16])
+        let promptKeys = MLXRandom.normal([1, 1, 3, 2])
+        let verifyKeys = MLXRandom.normal([1, 1, depth + 1, 2])
+        let kept = accepted + 1
+
+        let attention = KVCacheSimple()
+        let recurrent = MambaCache()
+        _ = attention.update(keys: promptKeys, values: -promptKeys)
+        _ = layer(prompt, cache: recurrent)
+        _ = attention.update(keys: verifyKeys, values: -verifyKeys)
+        _ = layer(verify, cache: recurrent, checkpointAfter: depth)
+
+        let referenceAttention = KVCacheSimple()
+        let referenceRecurrent = MambaCache()
+        _ = referenceAttention.update(keys: promptKeys, values: -promptKeys)
+        _ = layer(prompt, cache: referenceRecurrent)
+        let keptKeys = verifyKeys[0..., 0..., ..<kept, 0...]
+        _ = referenceAttention.update(keys: keptKeys, values: -keptKeys)
+        _ = layer(verify[0..., ..<kept, 0...], cache: referenceRecurrent)
+
+        let rewind = depth - accepted
+        let cache: [KVCache] = [attention, recurrent]
+        if rewind > 0 {
+            #expect(rewindSpeculativePromptCache(cache, numTokens: rewind) == rewind)
+        } else {
+            discardSpeculativePromptCacheCheckpoints(cache)
+        }
+        #expect(!recurrent.hasSpeculativeCheckpoint)
+        #expect(attention.offset == referenceAttention.offset)
+        #expect(attention.offset == 3 + kept)
+
+        for (actual, reference) in zip(attention.state, referenceAttention.state) {
+            let length = referenceAttention.offset
+            let actualPrefix = actual[0..., 0..., ..<length, 0...]
+            let referencePrefix = reference[0..., 0..., ..<length, 0...]
+            eval(actualPrefix, referencePrefix)
+            #expect(allClose(actualPrefix, referencePrefix, rtol: 0, atol: 0).item(Bool.self))
+        }
+        let restored = recurrent.state
+        #expect(restored.count == referenceRecurrent.state.count)
+        for (actual, reference) in zip(restored, referenceRecurrent.state) {
             eval(actual, reference)
             #expect(
                 allClose(actual, reference, rtol: gdnStateTolerance, atol: gdnStateTolerance)
