@@ -842,6 +842,7 @@ public enum Qwen35Language {
             if let last = checkpointAfter, last > 0, S > 1 {
                 // Run the gated-delta update once per part so the state after each of
                 // positions 1…last is available; projections and conv ran once above.
+                // A `last` of S or more still splits, at 1…S-1.
                 let splits = Array(1 ... min(last, S - 1))
                 let bounds = [0] + splits + [S]
                 var outs: [MLXArray] = []

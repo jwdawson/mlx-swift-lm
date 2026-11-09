@@ -1873,3 +1873,184 @@ func testDiscardingAGeneratedTokenDoesNotMoveTheTimeline() throws {
     #expect(timeline >= prompt.count + emitted - 1)
     #expect(iter.mainCacheStorage.nativeAttentionOffsetsAreAligned)
 }
+
+// MARK: - Native hybrid rewind across a multi-draft round
+
+/// A hybrid target: one attention layer and one recurrent layer whose state is a marker of how
+/// many positions it has seen. It takes the per-position checkpoints Qwen3.5 takes, so a rewind
+/// that restores the wrong one shows up as the wrong marker.
+private final class HybridRewindMainModel: Module, LanguageModel, KVCacheDimensionProvider,
+    SpeculativeCacheRewindModel
+{
+    static let vocabularySize = 16
+    var kvHeads: [Int] { [1] }
+    var maximumNativeTargetCacheRewind: Int { 4 }
+    let predictions: (Int) -> Int32
+
+    init(predictions: @escaping (Int) -> Int32) {
+        self.predictions = predictions
+        super.init()
+    }
+
+    static func marker(_ positions: Int) -> MLXArray { MLXArray([Float(positions)]) }
+
+    func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        [KVCacheSimple(), MambaCache()]
+    }
+
+    func prepare(
+        _ input: LMInput, cache: [KVCache], state _: LMOutput.State?, prefill _: PrefillParameters
+    ) throws -> PrepareResult {
+        .tokens(input.text)
+    }
+
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        makeLogits(from: cache?.first?.offset ?? 0, positions: inputs.dim(-1))
+    }
+
+    func callAsFunction(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        let positions = input.tokens.dim(-1)
+        let base = cache?.first?.offset ?? 0
+        let logits = makeLogits(from: base, positions: positions)
+        guard let cache, let recurrent = cache.last as? MambaCache else {
+            return LMOutput(logits: logits)
+        }
+
+        let keys = MLXArray(
+            (base ..< base + positions).flatMap { Array(repeating: Float($0), count: 4) },
+            [1, 1, positions, 4])
+        let presented = cache[0].update(keys: keys, values: keys)
+        if let last = state?[mtpCacheCheckpointIndexKey], positions > 1 {
+            recurrent.discardSpeculativeCheckpoint()
+            for split in 1 ... Swift.min(last, positions - 1) {
+                recurrent.saveSpeculativeCheckpoint(
+                    convState: Self.marker(base + split),
+                    recurrentState: Self.marker(base + split), advancedBy: split)
+            }
+        }
+        recurrent[0] = Self.marker(base + positions)
+        recurrent[1] = Self.marker(base + positions)
+        recurrent.advance(positions)
+
+        guard state?[mtpEmitFlagKey] ?? false else { return LMOutput(logits: logits) }
+        var out = LMOutput.State()
+        out[mtpLastHiddenStatesKey] = MLXArray.zeros([1, positions, 4])
+        out[mtpSharedKVStatesKey] = ["full_attention": presented]
+        out[mtpSharedKVSourceIndicesKey] = ["full_attention": 0]
+        return LMOutput(logits: logits, state: out)
+    }
+
+    private func makeLogits(from base: Int, positions: Int) -> MLXArray {
+        let vocab = Self.vocabularySize
+        var data = [Float](repeating: 0, count: positions * vocab)
+        for i in 0 ..< positions {
+            data[i * vocab + Int(predictions(base + i))] = 100
+        }
+        return MLXArray(data, [1, positions, vocab])
+    }
+}
+
+/// Drafts the same token every time and accepts any finalization.
+private final class ConstantResumableDrafter: Module, ResumableMTPDrafterModel {
+    let drafted: Int32
+    var requiresSharedTargetKV: Bool { false }
+
+    init(drafted: Int32) {
+        self.drafted = drafted
+        super.init()
+    }
+
+    func validateCompatibility(with _: any LanguageModel) throws {}
+
+    func makeState(parameters _: GenerateParameters?) -> MTPDrafterState {
+        MTPDrafterState(cache: [])
+    }
+
+    func finalizeDrafterState(
+        target _: any LanguageModel, targetBoundaryHidden _: MLXArray,
+        targetProcessedTokenCount: Int, discardedTargetTokens _: Int,
+        positionDeltas _: MLXArray?, state: inout MTPDrafterState
+    ) -> Bool {
+        state.nextPosition = targetProcessedTokenCount
+        return true
+    }
+
+    func resumeDrafterState(
+        target _: any LanguageModel, suffixTokens _: MLXArray, suffixTargetHidden _: MLXArray,
+        targetBoundaryHidden _: MLXArray, firstBonus _: MLXArray, positionDeltas _: MLXArray?,
+        state _: inout MTPDrafterState, sampler _: any LogitSampler
+    ) -> Bool {
+        true
+    }
+
+    func draftBlock(
+        target _: any LanguageModel, lastToken: MLXArray, lastHidden _: MLXArray,
+        sharedKV _: [String: (MLXArray, MLXArray)], positionDeltas _: MLXArray?,
+        queryOffset _: Int, blockSize: Int, sampler _: any LogitSampler
+    ) -> MLXArray {
+        drafts(batch: lastToken.dim(0), blockSize: blockSize)
+    }
+
+    func draftBlock(
+        target _: any LanguageModel, lastToken: MLXArray, lastHidden _: MLXArray,
+        sharedKV _: [String: (MLXArray, MLXArray)], positionDeltas _: MLXArray?,
+        queryOffset _: Int, blockSize: Int, state _: inout MTPDrafterState,
+        sampler _: any LogitSampler
+    ) -> MLXArray {
+        drafts(batch: lastToken.dim(0), blockSize: blockSize)
+    }
+
+    private func drafts(batch: Int, blockSize: Int) -> MLXArray {
+        MLXArray(
+            Array(repeating: drafted, count: batch * (blockSize - 1)), [batch, blockSize - 1])
+    }
+}
+
+@Suite
+struct MTPHybridFinalizationTests {
+    /// A round that accepts some but not all drafts, then a stop inside the accepted drafts: the
+    /// finalizing rewind needs a checkpoint the round's own rewind must have kept.
+    @Test(arguments: [(4, 2, 1), (5, 2, 1), (5, 3, 1), (5, 3, 2)])
+    func testFinalizingAPartialMultiDraftRoundRewindsTheHybridCache(
+        blockSize: Int, accepted: Int, consumedFromRound: Int
+    ) throws {
+        let prompt: [Int32] = [1, 2, 3]
+        let drafted: Int32 = 7
+        // Prompt positions predict 5 (the bonus); the round's drafts match until `accepted`.
+        let model = HybridRewindMainModel { position in
+            if position < prompt.count { return 5 }
+            return position < prompt.count + accepted ? drafted : 9
+        }
+        var iter = try MTPSpeculativeTokenIterator(
+            input: LMInput(tokens: MLXArray(prompt)),
+            mainModel: model, drafter: ConstantResumableDrafter(drafted: drafted),
+            mainCache: model.newCache(parameters: nil),
+            parameters: GenerateParameters(maxTokens: 20, temperature: 0), blockSize: blockSize)
+
+        // The prepare-time bonus, then part of the round's accepted drafts.
+        var emitted: [Int] = []
+        while emitted.count < 1 + consumedFromRound, let token = iter.next() {
+            emitted.append(token)
+        }
+        #expect(emitted == [5] + Array(repeating: Int(drafted), count: consumedFromRound))
+        #expect(iter.proposedCount == blockSize - 1)
+        #expect(iter.acceptedCount == accepted)
+        iter.finalizeGeneration()
+
+        let position = prompt.count + emitted.count
+        let continuation = try #require(iter.mtpDrafterContinuation)
+        #expect(continuation.targetProcessedTokenCount == position)
+        #expect(iter.mainCacheStorage.processedTokenCount == position)
+        let cache = iter.mainCacheStorage.cache
+        #expect(cache[0].offset == position)
+        let recurrent = try #require(cache[1] as? MambaCache)
+        #expect(!recurrent.hasSpeculativeCheckpoint)
+        let state = recurrent.state
+        #expect(state.count == 2)
+        for array in state {
+            #expect(array.item(Float.self) == Float(position))
+        }
+    }
+}

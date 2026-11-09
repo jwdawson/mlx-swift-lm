@@ -526,8 +526,8 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
     /// the longest matching prefix, emit the bonus correction.
     mutating func speculateRound() {
         guard !passthrough else { return }
-        // A prior all-accepted round may keep one recurrent checkpoint until
-        // its pending output is drained so early finalization can rewind it.
+        // A prior round may keep recurrent checkpoints until its pending
+        // output is drained so early finalization can rewind it.
         discardSpeculativePromptCacheCheckpoints(mainCache)
 
         // A speculative round can emit up to `numDraft + 1` tokens: the
@@ -907,9 +907,9 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 extension MTPSpeculativeTokenIterator: GenerationFinalizingTokenIterator {
     mutating func finalizeGeneration() {
         defer { processor?.finalizeGeneration() }
-        // A fully consumed all-accepted round can still retain the recurrent
-        // checkpoint used for early-finalization rollback. Release it even
-        // when no committed lookahead remains.
+        // A fully consumed round can still retain the recurrent checkpoints
+        // used for early-finalization rollback. Release them even when no
+        // committed lookahead remains.
         var discardedTargetTokens = 0
         defer {
             discardSpeculativePromptCacheCheckpoints(mainCache)

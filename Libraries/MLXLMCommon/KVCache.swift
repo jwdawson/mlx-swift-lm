@@ -1805,6 +1805,7 @@ public class MambaCache: ArraysCache {
 
     /// One checkpoint per split of the verify pass, in order. A pass of `S`
     /// tokens checkpoints after positions 1…S-1, so the last is one before the end.
+    /// A restore keeps the ones before it, which keeps that true at the new end.
     private var speculativeCheckpoints: [SpeculativeCheckpoint] = []
 
     public init(leftPadding: [Int]? = nil) {
@@ -1835,16 +1836,17 @@ public class MambaCache: ArraysCache {
     }
 
     /// Restore the state as it was `n` positions before the end of the verify
-    /// write, and drop every checkpoint.
+    /// write. Earlier checkpoints stay, so a later rewind from the new end still works.
     @discardableResult
     package func restoreSpeculativeCheckpoint(rewinding n: Int) -> Bool {
         guard n > 0, n <= speculativeCheckpoints.count else { return false }
-        let checkpoint = speculativeCheckpoints[speculativeCheckpoints.count - n]
+        let kept = speculativeCheckpoints.count - n
+        let checkpoint = speculativeCheckpoints[kept]
         cache = checkpoint.state
         offset = checkpoint.offset
         leftPadding = checkpoint.leftPadding
         lengths = checkpoint.lengths
-        speculativeCheckpoints = []
+        speculativeCheckpoints.removeSubrange(kept...)
         return true
     }
 

@@ -688,7 +688,7 @@ struct Qwen35MTPMetalTests {
             #expect(allClose(speculative, full, rtol: 1e-5, atol: 1e-5).item(Bool.self))
             #expect(speculativeCache.hasSpeculativeCheckpoint)
             #expect(speculativeCache.restoreSpeculativeCheckpoint(rewinding: 5 - position))
-            #expect(!speculativeCache.hasSpeculativeCheckpoint)
+            #expect(speculativeCache.speculativeCheckpointCount == position - 1)
 
             let restored = speculativeCache.state
             let expected = prefixCache.state
@@ -744,48 +744,69 @@ struct Qwen35MTPMetalTests {
         let verify = MLXRandom.normal([1, depth + 1, 16])
         let promptKeys = MLXRandom.normal([1, 1, 3, 2])
         let verifyKeys = MLXRandom.normal([1, 1, depth + 1, 2])
-        let kept = accepted + 1
 
-        let attention = KVCacheSimple()
-        let recurrent = MambaCache()
-        _ = attention.update(keys: promptKeys, values: -promptKeys)
-        _ = layer(prompt, cache: recurrent)
-        _ = attention.update(keys: verifyKeys, values: -verifyKeys)
-        _ = layer(verify, cache: recurrent, checkpointAfter: depth)
-
-        let referenceAttention = KVCacheSimple()
-        let referenceRecurrent = MambaCache()
-        _ = referenceAttention.update(keys: promptKeys, values: -promptKeys)
-        _ = layer(prompt, cache: referenceRecurrent)
-        let keptKeys = verifyKeys[0..., 0..., ..<kept, 0...]
-        _ = referenceAttention.update(keys: keptKeys, values: -keptKeys)
-        _ = layer(verify[0..., ..<kept, 0...], cache: referenceRecurrent)
-
-        let rewind = depth - accepted
-        let cache: [KVCache] = [attention, recurrent]
-        if rewind > 0 {
-            #expect(rewindSpeculativePromptCache(cache, numTokens: rewind) == rewind)
-        } else {
-            discardSpeculativePromptCacheCheckpoints(cache)
+        // Prompt, then a verify write of `depth + 1`, then the round's rewind to `accepted + 1`.
+        func roundCache() -> (KVCacheSimple, MambaCache) {
+            let attention = KVCacheSimple()
+            let recurrent = MambaCache()
+            _ = attention.update(keys: promptKeys, values: -promptKeys)
+            _ = layer(prompt, cache: recurrent)
+            _ = attention.update(keys: verifyKeys, values: -verifyKeys)
+            _ = layer(verify, cache: recurrent, checkpointAfter: depth)
+            let rejected = depth - accepted
+            if rejected > 0 {
+                #expect(
+                    rewindSpeculativePromptCache([attention, recurrent], numTokens: rejected)
+                        == rejected)
+            }
+            // The checkpoints before the kept end stay for a later rewind.
+            #expect(recurrent.speculativeCheckpointCount == accepted)
+            return (attention, recurrent)
         }
-        #expect(!recurrent.hasSpeculativeCheckpoint)
-        #expect(attention.offset == referenceAttention.offset)
-        #expect(attention.offset == 3 + kept)
 
-        for (actual, reference) in zip(attention.state, referenceAttention.state) {
-            let length = referenceAttention.offset
-            let actualPrefix = actual[0..., 0..., ..<length, 0...]
-            let referencePrefix = reference[0..., 0..., ..<length, 0...]
-            eval(actualPrefix, referencePrefix)
-            #expect(allClose(actualPrefix, referencePrefix, rtol: 0, atol: 0).item(Bool.self))
+        func expectPlainForward(
+            over kept: Int, attention: KVCacheSimple, recurrent: MambaCache
+        ) {
+            let referenceAttention = KVCacheSimple()
+            let referenceRecurrent = MambaCache()
+            _ = referenceAttention.update(keys: promptKeys, values: -promptKeys)
+            _ = layer(prompt, cache: referenceRecurrent)
+            let keptKeys = verifyKeys[0..., 0..., ..<kept, 0...]
+            _ = referenceAttention.update(keys: keptKeys, values: -keptKeys)
+            _ = layer(verify[0..., ..<kept, 0...], cache: referenceRecurrent)
+
+            #expect(attention.offset == referenceAttention.offset)
+            #expect(attention.offset == 3 + kept)
+            for (actual, reference) in zip(attention.state, referenceAttention.state) {
+                let length = referenceAttention.offset
+                let actualPrefix = actual[0..., 0..., ..<length, 0...]
+                let referencePrefix = reference[0..., 0..., ..<length, 0...]
+                eval(actualPrefix, referencePrefix)
+                #expect(
+                    allClose(actualPrefix, referencePrefix, rtol: 0, atol: 0).item(Bool.self))
+            }
+            let restored = recurrent.state
+            #expect(restored.count == referenceRecurrent.state.count)
+            for (actual, reference) in zip(restored, referenceRecurrent.state) {
+                eval(actual, reference)
+                #expect(
+                    allClose(actual, reference, rtol: gdnStateTolerance, atol: gdnStateTolerance)
+                        .item(Bool.self))
+            }
         }
-        let restored = recurrent.state
-        #expect(restored.count == referenceRecurrent.state.count)
-        for (actual, reference) in zip(restored, referenceRecurrent.state) {
-            eval(actual, reference)
+
+        let (attention, recurrent) = roundCache()
+        expectPlainForward(over: accepted + 1, attention: attention, recurrent: recurrent)
+
+        // Finalization after consuming `consumed` of the accepted drafts rewinds the rest.
+        for consumed in 0 ..< accepted {
+            let (attention, recurrent) = roundCache()
+            let lookahead = accepted - consumed
             #expect(
-                allClose(actual, reference, rtol: gdnStateTolerance, atol: gdnStateTolerance)
-                    .item(Bool.self))
+                rewindSpeculativePromptCache([attention, recurrent], numTokens: lookahead)
+                    == lookahead)
+            #expect(recurrent.speculativeCheckpointCount == consumed)
+            expectPlainForward(over: consumed + 1, attention: attention, recurrent: recurrent)
         }
     }
 
