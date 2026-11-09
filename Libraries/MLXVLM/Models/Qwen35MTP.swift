@@ -283,7 +283,8 @@ public final class Qwen35VLMNextNDraftModel: Module, ResumableMTPDrafterModel {
             state.seedHidden = nil
             state.proposalAppended = 0
             guard blockSize > 2, let seedHidden else { return seed }
-            // Chain past the seed from its own hidden state; commit trims the rejected entries.
+            // Chain past the seed from its own hidden state, then drop those entries so commit
+            // re-feeds every accepted draft with the target's hidden rows.
             let chained = draftMTPTokenBlock(
                 targetEmbedTokens: targetEmbedTokens,
                 lmHead: lmHead,
@@ -302,8 +303,7 @@ public final class Qwen35VLMNextNDraftModel: Module, ResumableMTPDrafterModel {
                     positionOffset: positionOffset,
                     positionDeltas: positionDeltas)
             }
-            state.proposalAppended = blockSize - 2
-            state.nextPosition += state.proposalAppended
+            trimPromptCache(state.cache, numTokens: blockSize - 2)
             return concatenated([seed, chained], axis: 1)
         }
 

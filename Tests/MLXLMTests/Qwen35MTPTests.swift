@@ -376,10 +376,15 @@ struct Qwen35MTPMetalTests {
         let patterns = counts.flatMap { first in counts.map { [first, $0] } }
         for pattern in patterns {
             var state = drafter.makeState(parameters: nil)
+            // Reference: fed only verified tokens with the target's hidden rows, never a draft.
+            var reference = drafter.makeState(parameters: nil)
             var bonus = MLXArray([Int32(4)])
             drafter.prepareDrafterState(
                 target: target, promptTokens: prompt, targetHidden: promptHidden,
                 firstBonus: bonus, positionDeltas: nil, state: &state, sampler: sampler)
+            drafter.prepareDrafterState(
+                target: target, promptTokens: prompt, targetHidden: promptHidden,
+                firstBonus: bonus, positionDeltas: nil, state: &reference, sampler: sampler)
             eval(state.seedToken!, state.seedHidden!)
             #expect(state.cache.allSatisfy { $0.offset == 3 })
             #expect(state.nextPosition == 3)
@@ -392,23 +397,40 @@ struct Qwen35MTPMetalTests {
                     positionDeltas: nil, queryOffset: expectedPosition, blockSize: blockSize,
                     state: &state, sampler: sampler)
                 eval(proposal)
-                // The seed is waiting; the chained tokens after it each add a drafter entry.
+                // The seed is waiting; the chained drafts leave no drafter entry behind.
                 #expect(proposal.dim(1) == numDraft)
-                #expect(state.proposalAppended == numDraft - 1)
-                #expect(state.nextPosition == expectedPosition + numDraft - 1)
-                #expect(state.cache.allSatisfy { $0.offset == state.nextPosition })
+                #expect(state.proposalAppended == 0)
+                #expect(state.nextPosition == expectedPosition)
+                #expect(state.cache.allSatisfy { $0.offset == expectedPosition })
 
-                let verifyHidden = MLXArray.zeros([1, blockSize, cfg.hiddenSize])
+                let verifyHidden = MLXRandom.normal([1, blockSize, cfg.hiddenSize])
                 let finalToken = MLXArray([Int32(8 + accepted)])
                 drafter.commitDrafterState(
                     target: target, targetHidden: verifyHidden, draftTokens: proposal,
                     acceptedCount: accepted, finalToken: finalToken, positionDeltas: nil,
                     state: &state, sampler: sampler)
+                reference.seedToken = nil
+                reference.seedHidden = nil
+                drafter.commitDrafterState(
+                    target: target, targetHidden: verifyHidden, draftTokens: proposal,
+                    acceptedCount: accepted, finalToken: finalToken, positionDeltas: nil,
+                    state: &reference, sampler: sampler)
                 eval(state.seedToken!, state.seedHidden!)
                 expectedPosition += accepted + 1
                 #expect(state.cache.allSatisfy { $0.offset == expectedPosition })
                 #expect(state.nextPosition == expectedPosition)
                 #expect(state.proposalAppended == 0)
+                // Every kept entry is conditioned on the target, as if never drafted.
+                for (cache, referenceCache) in zip(state.cache, reference.cache) {
+                    for (array, referenceArray) in zip(cache.state, referenceCache.state) {
+                        #expect(
+                            allClose(array, referenceArray, atol: 1e-5).item(Bool.self),
+                            "pattern \(pattern) accepted \(accepted)")
+                    }
+                }
+                #expect(
+                    state.seedToken!.asArray(Int32.self) == reference.seedToken!.asArray(Int32.self)
+                )
                 bonus = finalToken
             }
         }
